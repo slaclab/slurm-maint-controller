@@ -629,7 +629,7 @@ class SlurmController:
             #     text=True,
             #     check=True,
             # )
-            logger.success(f"Job {job.job_id} terminated successfully")
+            logger.warning(f"TO BE IMPLEMENTED: Job {job.job_id} terminated successfully")
             return True
 
         except subprocess.CalledProcessError as e:
@@ -702,9 +702,152 @@ class SlurmController:
             return False
 
 
+def parse_duration_string(time_str: str) -> pendulum.Duration:
+    """Convert HH:MM:SS string to Pendulum Duration."""
+    hours, minutes, seconds = map(int, time_str.split(":"))
+    return pendulum.duration(hours=hours, minutes=minutes, seconds=seconds)
+
+
+def run_reservation_manager(
+    nodes: Tuple[str, ...],
+    duration: str,
+    user: Optional[str],
+    account: Optional[str],
+    flags: Optional[str],
+    dry_run: bool,
+    log_level: str,
+    terminate_preemptable_jobs: bool,
+) -> None:
+    """
+    Main logic for managing Slurm reservations based on running jobs.
+
+    This function performs the following steps for each node:
+    1. Queries all running jobs on the node
+    2. Separates jobs into preemptable and non-preemptable categories
+    3. Determines reservation start time based on job types:
+       - If only preemptable jobs exist: terminates all and starts immediately
+       - If both types exist: terminates preemptable jobs that would run past
+         non-preemptable jobs, and schedules reservation after longest non-preemptable job
+       - If only non-preemptable jobs exist: schedules reservation after longest job
+    4. Creates or updates a maintenance reservation for the specified duration
+
+    Args:
+        nodes: Tuple of node specifications (e.g., 'node[1-10]'). If empty, uses all cluster nodes.
+        duration: Duration string in HH:MM:SS format for the reservation length.
+        user: Username(s) to associate with the reservation.
+        account: Account(s) to associate with the reservation.
+        flags: Slurm reservation flags (e.g., 'MAINT', 'IGNORE_JOBS').
+        dry_run: If True, only logs actions without executing them.
+        log_level: Logging verbosity level (not currently used in this function).
+        terminate_preemptable: If True, allows termination of preemptable jobs.
+
+    Returns:
+        None
+    """
+
+    # Initialize controller
+    controller = SlurmController(dry_run=dry_run)
+    node_names = []
+
+    if nodes:
+        expanded_nodes: List[str] = []
+        for node_spec in nodes:
+            try:
+                expanded = expand_node_spec(node_spec)
+            except ValueError as exc:
+                logger.error(
+                    f"Failed to expand node specification '{node_spec}': {exc}"
+                )
+                continue
+            if not expanded:
+                logger.warning(f"No nodes matched specification '{node_spec}'")
+            expanded_nodes.extend(expanded)
+        node_names = list(dict.fromkeys(expanded_nodes))
+        if not nodes:
+            logger.warning("No valid nodes derived from user input; exiting.")
+            return
+        logger.info(f"Using user-specified nodes: {', '.join(node_names)}")
+    else:
+        # Get all nodes in the cluster
+        node_names = controller.get_all_nodes()
+
+    for node_name in node_names:
+
+        reservation_start_time = pendulum.now()
+
+        # Find longest job across all nodes
+        job_list = controller.get_jobs_on_node(node_name)
+        preemptable_jobs = JobList(job_list.filter(qos="preemptable"))
+        longest_preemptable_job = preemptable_jobs.get_longest_job()
+        non_preemptable_jobs = JobList(job_list.filter(qos="!preemptable"))
+        longest_non_preemptable_job = non_preemptable_jobs.get_longest_job()
+        logger.info(
+            f"Longest preemptable job on {node_name}: {longest_preemptable_job}"
+        )
+        logger.info(
+            f"Longest non-preemptable job on {node_name}: {longest_non_preemptable_job}"
+        )
+
+        # if only preemptable jobs, then terminate all jobs on node
+        if len(non_preemptable_jobs) == 0:
+
+            if terminate_preemptable_jobs:
+                logger.info(f"No non-preemptable jobs on {node_name}, terminating all jobs")
+                for preemptable_job in preemptable_jobs:
+                    controller.terminate_job(preemptable_job)
+
+                reservation_start_time = pendulum.now() + pendulum.duration(seconds=1)
+            else:
+
+                # TODO: problem is that we can't set a reservation if there are jobs already running the time frame
+                logger.info(f"No non-preemptable jobs on {node_name}, but termination disabled")
+                if longest_preemptable_job:
+                    reservation_start_time = longest_preemptable_job.end_time
+                else:
+                    reservation_start_time = pendulum.now() + pendulum.duration(seconds=1)
+
+        # If there's a non-preemptable job and preemptable jobs exist
+        elif longest_non_preemptable_job and preemptable_jobs:
+
+            if terminate_preemptable_jobs:
+                # Check if any preemptable job has an end_time after the non-preemptable job
+                for preemptable_job in preemptable_jobs:
+                    if preemptable_job.end_time > longest_non_preemptable_job.end_time:
+                        logger.info(
+                            f"Preemptable job {preemptable_job.job_id} ends after non-preemptable job, terminating all preemptable job"
+                        )
+                        # Terminate all preemptable jobs on this node
+                        controller.terminate_job(preemptable_job)
+
+            reservation_start_time = longest_non_preemptable_job.end_time
+
+        else:
+            logger.warning(f"Only non-preemptable jobs on {node_name}")
+
+            reservation_start_time = longest_non_preemptable_job.end_time
+
+        # TODO: do i need to wait for the jobs to finish first?
+
+        # set the advanced reservation to the end_time of the longest non-preemptable job
+        pendulum_duration = parse_duration_string(duration)
+        reservation = Reservation(
+            name=f"maint:{node_name}",
+            nodes=[node_name],
+            start_time=reservation_start_time,
+            duration=pendulum_duration,
+            user=user,
+            account=account,
+            flags=flags,
+        )
+
+        logger.warning(f"Will create reservation {reservation}")
+        controller.create_reservation(reservation)
+
+
+
 @click.command()
 @click.option(
-    "--node",
+    "--nodes",
     "-n",
     multiple=True,
     help="Specific node(s) to consider (can be provided multiple times)",
@@ -729,6 +872,12 @@ class SlurmController:
 @click.option("--flags", "-f", help="Reservation flags")
 @click.option("--dry-run", is_flag=True, help="Don't actually create the reservation")
 @click.option(
+    "--terminate-preemptable-jobs",
+    is_flag=True,
+    default=False,
+    help="Allow termination of preemptable jobs",
+)
+@click.option(
     "--log-level",
     type=click.Choice(
         ["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]
@@ -736,19 +885,22 @@ class SlurmController:
     default="INFO",
     help="Logging level",
 )
+
+# main
 def main(
+    nodes: Tuple[str, ...],
     duration: str,
     user: Optional[str],
     account: Optional[str],
     flags: Optional[str],
-    node: Tuple[str, ...],
     dry_run: bool,
+    terminate_preemptable_jobs: bool,
     log_level: str,
 ) -> None:
     """
-    Find the longest running job on Slurm and create a reservation
-    starting when that job finishes.
+    CLI entry point for Slurm Reservation Manager.
     """
+
     # Configure logging
     logger.remove()
     logger.add(
@@ -758,97 +910,18 @@ def main(
         colorize=True,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
     )
-
     logger.info("Starting Slurm Reservation Manager")
 
-    # Initialize controller
-    controller = SlurmController(dry_run=dry_run)
-
-    if node:
-        expanded_nodes: List[str] = []
-        for node_spec in node:
-            try:
-                expanded = expand_node_spec(node_spec)
-            except ValueError as exc:
-                logger.error(
-                    f"Failed to expand node specification '{node_spec}': {exc}"
-                )
-                continue
-            if not expanded:
-                logger.warning(f"No nodes matched specification '{node_spec}'")
-            expanded_nodes.extend(expanded)
-        nodes = list(dict.fromkeys(expanded_nodes))
-        if not nodes:
-            logger.warning("No valid nodes derived from user input; exiting.")
-            return
-        logger.info(f"Using user-specified nodes: {', '.join(nodes)}")
-    else:
-        # Get all nodes in the cluster
-        nodes = controller.get_all_nodes()
-
-    for node_name in nodes:
-        reservation_start_time = pendulum.now()
-
-        # Find longest job across all nodes
-        job_list = controller.get_jobs_on_node(node_name)
-        preemptable_jobs = JobList(job_list.filter(qos="preemptable"))
-        longest_preemptable_job = preemptable_jobs.get_longest_job()
-        non_preemptable_jobs = JobList(job_list.filter(qos="!preemptable"))
-        longest_non_preemptable_job = non_preemptable_jobs.get_longest_job()
-        logger.info(
-            f"Longest preemptable job on {node_name}: {longest_preemptable_job}"
-        )
-        logger.info(
-            f"Longest non-preemptable job on {node_name}: {longest_non_preemptable_job}"
-        )
-
-        # if only preemptable jobs, then terminate all jobs on node
-        if len(non_preemptable_jobs) == 0:
-            logger.info(f"No non-preemptable jobs on {node_name}, terminating all jobs")
-            for preemptable_job in preemptable_jobs:
-                controller.terminate_job(preemptable_job)
-
-            reservation_start_time = pendulum.now()
-
-        # If there's a non-preemptable job and preemptable jobs exist
-        elif longest_non_preemptable_job and preemptable_jobs:
-            # Check if any preemptable job has an end_time after the non-preemptable job
-            for preemptable_job in preemptable_jobs:
-                if preemptable_job.end_time > longest_non_preemptable_job.end_time:
-                    logger.info(
-                        f"Preemptable job {preemptable_job.job_id} ends after non-preemptable job, terminating all preemptable job"
-                    )
-                    # Terminate all preemptable jobs on this node
-                    controller.terminate_job(preemptable_job)
-
-            reservation_start_time = longest_non_preemptable_job.end_time
-
-        else:
-            logger.warning(f"Only non-preemptable jobs on {node_name}")
-
-            reservation_start_time = longest_non_preemptable_job.end_time
-
-        # TODO: do i need to wait for the jobs to finish first?
-
-        # set the advanced reservation to the end_time of the longest non-preemptable job
-        def parse_duration_string(time_str):
-            """Convert HH:MM:SS string to Pendulum Duration."""
-            hours, minutes, seconds = map(int, time_str.split(":"))
-            return pendulum.duration(hours=hours, minutes=minutes, seconds=seconds)
-
-        pendulum_duration = parse_duration_string(duration)
-        reservation = Reservation(
-            name=f"maint:{node_name}",
-            nodes=[node_name],
-            start_time=reservation_start_time,
-            duration=pendulum_duration,
-            user=user,
-            account=account,
-            flags=flags,
-        )
-
-        logger.warning(f"Will create reservation {reservation}")
-        controller.create_reservation(reservation)
+    run_reservation_manager(
+        nodes=nodes,
+        duration=duration,
+        user=user,
+        account=account,
+        flags=flags,
+        dry_run=dry_run,
+        log_level=log_level,
+        terminate_preemptable_jobs=terminate_preemptable_jobs,
+    )
 
 
 if __name__ == "__main__":
