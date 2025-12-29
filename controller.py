@@ -9,12 +9,14 @@ an advanced reservation starting when that job finishes.
 import re
 import subprocess
 import sys
+import getpass
+
 from dataclasses import dataclass
 from pathlib import Path
-from sqlite3.dbapi2 import PARSE_COLNAMES
+
 from sre_parse import parse
 from types import LambdaType
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import click
 import pendulum
@@ -258,7 +260,7 @@ class Reservation:
     start_time: pendulum.DateTime
     duration: pendulum.Duration
     user: Optional[str] = None
-    partition: Optional[str] = None
+    account: Optional[str] = None
     flags: Optional[str] = None
 
     def to_command(self) -> List[str]:
@@ -276,8 +278,8 @@ class Reservation:
         if self.user:
             cmd.append(f"Users={self.user}")
 
-        if self.partition:
-            cmd.append(f"PartitionName={self.partition}")
+        if self.account:
+            cmd.append(f"Accounts={self.account}")
 
         if self.flags:
             cmd.append(f"Flags={self.flags}")
@@ -302,6 +304,63 @@ class Reservation:
             f"starts {self.start_time.to_datetime_string()}, "
             f"duration {self._format_duration()}"
         )
+
+def expand_node_spec(node_spec: str) -> Tuple[str, ...]:
+    """
+    Expand a Slurm-style node expression into a tuple of node names.
+
+    Args:
+        node_spec: Expression such as 'sdfmilan[104,107-108,113,116]'.
+
+    Returns:
+        Tuple of expanded node names, e.g.
+        ('sdfmilan104', 'sdfmilan107', 'sdfmilan108', 'sdfmilan113', 'sdfmilan116').
+
+    Raises:
+        ValueError: If the node specification contains malformed ranges.
+    """
+    if node_spec is None:
+        return tuple()
+
+    node_spec = node_spec.strip()
+    if not node_spec:
+        return tuple()
+
+    match = re.fullmatch(r"([^\[\]]+)\[(.+)\]", node_spec)
+    if not match:
+        return (node_spec,)
+
+    prefix, range_part = match.groups()
+    nodes: List[str] = []
+
+    for chunk in range_part.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+
+        if "-" in chunk:
+            start_str, end_str = chunk.split("-", 1)
+            if not start_str or not end_str:
+                raise ValueError(f"Invalid range segment '{chunk}' in '{node_spec}'")
+
+            width = max(len(start_str), len(end_str))
+            try:
+                start = int(start_str)
+                end = int(end_str)
+            except ValueError as exc:
+                raise ValueError(f"Non-numeric range bounds in '{chunk}'") from exc
+
+            step = 1 if end >= start else -1
+            for value in range(start, end + step, step):
+                nodes.append(f"{prefix}{str(value).zfill(width)}")
+        else:
+            try:
+                value = int(chunk)
+                nodes.append(f"{prefix}{str(value).zfill(len(chunk))}")
+            except ValueError:
+                nodes.append(f"{prefix}{chunk}")
+
+    return tuple(nodes)
 
 
 class SlurmController:
@@ -574,14 +633,13 @@ class SlurmController:
             return True
 
         try:
-            # result = subprocess.run(
-            #     cmd,
-            #     capture_output=True,
-            #     text=True,
-            #     check=True
-            # )
-            # logger.success(f"Reservation created successfully: {result.stdout}")
-            logger.error("shouldn't create reservation")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            logger.success(f"Reservation created successfully: {result.stdout}")
             return True
 
         except subprocess.CalledProcessError as e:
@@ -591,13 +649,28 @@ class SlurmController:
 
 @click.command()
 @click.option(
+    "--node",
+    "-n",
+    multiple=True,
+    help="Specific node(s) to consider (can be provided multiple times)",
+)
+@click.option(
     "--duration",
     "-d",
-    default="1:00:00",
+    default="6:00:00",
     help="Duration for the reservation (HH:MM:SS format)",
 )
-@click.option("--user", "-u", help="User(s) for the reservation")
-@click.option("--partition", "-p", help="Partition for the reservation")
+@click.option(
+    "--user",
+    "-u",
+    default=getpass.getuser(),
+    help="Username(s) for the reservation",
+)
+@click.option(
+    "--account",
+    "-A",
+    help="Account(s) for the reservation",
+)
 @click.option("--flags", "-f", help="Reservation flags")
 @click.option("--dry-run", is_flag=True, help="Don't actually create the reservation")
 @click.option(
@@ -611,8 +684,9 @@ class SlurmController:
 def main(
     duration: str,
     user: Optional[str],
-    partition: Optional[str],
+    account: Optional[str],
     flags: Optional[str],
+    node: Tuple[str, ...],
     dry_run: bool,
     log_level: str,
 ) -> None:
@@ -635,26 +709,47 @@ def main(
     # Initialize controller
     controller = SlurmController(dry_run=dry_run)
 
-    # Get all nodes in the cluster
-    nodes = controller.get_all_nodes()
+    if node:
+        expanded_nodes: List[str] = []
+        for node_spec in node:
+            try:
+                expanded = expand_node_spec(node_spec)
+            except ValueError as exc:
+                logger.error(
+                    f"Failed to expand node specification '{node_spec}': {exc}"
+                )
+                continue
+            if not expanded:
+                logger.warning(f"No nodes matched specification '{node_spec}'")
+            expanded_nodes.extend(expanded)
+        nodes = list(dict.fromkeys(expanded_nodes))
+        if not nodes:
+            logger.warning("No valid nodes derived from user input; exiting.")
+            return
+        logger.info(f"Using user-specified nodes: {', '.join(nodes)}")
+    else:
+        # Get all nodes in the cluster
+        nodes = controller.get_all_nodes()
 
-    for node in nodes:
+    for node_name in nodes:
         reservation_start_time = pendulum.now()
 
         # Find longest job across all nodes
-        job_list = controller.get_jobs_on_node(node)
+        job_list = controller.get_jobs_on_node(node_name)
         preemptable_jobs = JobList(job_list.filter(qos="preemptable"))
         longest_preemptable_job = preemptable_jobs.get_longest_job()
         non_preemptable_jobs = JobList(job_list.filter(qos="!preemptable"))
         longest_non_preemptable_job = non_preemptable_jobs.get_longest_job()
-        logger.info(f"Longest preemptable job on {node}: {longest_preemptable_job}")
         logger.info(
-            f"Longest non-preemptable job on {node}: {longest_non_preemptable_job}"
+            f"Longest preemptable job on {node_name}: {longest_preemptable_job}"
+        )
+        logger.info(
+            f"Longest non-preemptable job on {node_name}: {longest_non_preemptable_job}"
         )
 
         # if only preemptable jobs, then terminate all jobs on node
         if len(non_preemptable_jobs) == 0:
-            logger.info(f"No non-preemptable jobs on {node}, terminating all jobs")
+            logger.info(f"No non-preemptable jobs on {node_name}, terminating all jobs")
             for preemptable_job in preemptable_jobs:
                 controller.terminate_job(preemptable_job)
 
@@ -674,7 +769,7 @@ def main(
             reservation_start_time = longest_non_preemptable_job.end_time
 
         else:
-            logger.warning(f"Only non-preemptable jobs on {node}")
+            logger.warning(f"Only non-preemptable jobs on {node_name}")
 
             reservation_start_time = longest_non_preemptable_job.end_time
 
@@ -688,10 +783,13 @@ def main(
 
         pendulum_duration = parse_duration_string(duration)
         reservation = Reservation(
-            name=f"maint:{node}",
-            nodes=[node],
+            name=f"maint:{node_name}",
+            nodes=[node_name],
             start_time=reservation_start_time,
             duration=pendulum_duration,
+            user=user,
+            account=account,
+            flags=flags,
         )
 
         logger.warning(f"Will create reservation {reservation}")
