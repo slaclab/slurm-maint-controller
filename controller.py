@@ -286,6 +286,29 @@ class Reservation:
 
         return cmd
 
+    def to_update_command(self) -> List[str]:
+        """Generate scontrol command to update an existing reservation."""
+        cmd = [
+            "scontrol",
+            "update",
+            "reservation",
+            f"ReservationName={self.name}",
+            f"StartTime={self.start_time.format('YYYY-MM-DDTHH:mm:ss')}",
+            f"Duration={self._format_duration()}",
+            f"Nodes={','.join(self.nodes)}",
+        ]
+
+        if self.user:
+            cmd.append(f"Users={self.user}")
+
+        if self.account:
+            cmd.append(f"Accounts={self.account}")
+
+        if self.flags:
+            cmd.append(f"Flags={self.flags}")
+
+        return cmd
+
     def _format_duration(self) -> str:
         """Format duration in Slurm format (days-hours:minutes:seconds)."""
         total_seconds = int(self.duration.total_seconds())
@@ -613,9 +636,33 @@ class SlurmController:
             logger.error(f"Failed to terminate job {job.job_id}: {e.stderr}")
             return False
 
+    def _reservation_exists(self, name: str) -> bool:
+        """
+        Determine whether a reservation already exists.
+
+        Args:
+            name: Reservation name
+
+        Returns:
+            True if the reservation exists, False otherwise.
+        """
+        try:
+            result = subprocess.run(
+                ["scontrol", "show", "reservation", name],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return bool(result.stdout.strip())
+        except subprocess.CalledProcessError as e:
+            if "Invalid reservation" in (e.stderr or ""):
+                return False
+            logger.error(f"Failed to check reservation '{name}': {e.stderr}")
+            raise
+
     def create_reservation(self, reservation: Reservation) -> bool:
         """
-        Create a Slurm reservation.
+        Create or update a Slurm reservation.
 
         Args:
             reservation: Reservation object
@@ -623,9 +670,15 @@ class SlurmController:
         Returns:
             True if successful, False otherwise
         """
-        logger.info(f"Creating reservation: {reservation}")
+        try:
+            exists = self._reservation_exists(reservation.name)
+        except subprocess.CalledProcessError:
+            return False
 
-        cmd = reservation.to_command()
+        action = "Updating" if exists else "Creating"
+        cmd = reservation.to_update_command() if exists else reservation.to_command()
+
+        logger.info(f"{action} reservation: {reservation}")
         logger.debug(f"Command: {' '.join(cmd)}")
 
         if self.dry_run:
@@ -639,11 +692,13 @@ class SlurmController:
                 text=True,
                 check=True
             )
-            logger.success(f"Reservation created successfully: {result.stdout}")
+            logger.success(
+                f"Reservation {action.lower()} succeeded: {result.stdout}"
+            )
             return True
 
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to create reservation: {e.stderr}")
+            logger.error(f"Failed to {action.lower()} reservation: {e.stderr}")
             return False
 
 
