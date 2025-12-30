@@ -647,17 +647,32 @@ class SlurmController:
             True if the reservation exists, False otherwise.
         """
         try:
+            cmd = ["scontrol", "show", "reservation", name]
+            logger.debug(f"Checking reservation existence with command: {' '.join(cmd)}")
             result = subprocess.run(
-                ["scontrol", "show", "reservation", name],
+                cmd,
                 capture_output=True,
                 text=True,
-                check=True,
+                check=False,
             )
-            return bool(result.stdout.strip())
-        except subprocess.CalledProcessError as e:
-            if "Invalid reservation" in (e.stderr or ""):
+            # Check if the command succeeded and returned output
+            if result.returncode == 0 and result.stdout.strip():
+                return True
+            # Check for "not found" or "Invalid reservation" messages in stdout (not stderr)
+            if "not found" in result.stdout.lower() or "invalid reservation" in result.stdout.lower():
                 return False
-            logger.error(f"Failed to check reservation '{name}': {e.stderr}")
+            # Also check stderr just in case
+            if "not found" in result.stderr.lower() or "invalid reservation" in result.stderr.lower():
+                return False
+            # If we got a non-zero return code for some other reason, that's an error
+            if result.returncode != 0:
+                logger.error(f"Failed to check reservation '{name}': {result.stderr}")
+                raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+            return False
+        except Exception as e:
+            if isinstance(e, subprocess.CalledProcessError):
+                raise
+            logger.error(f"Unexpected error checking reservation '{name}': {e}")
             raise
 
     def create_reservation(self, reservation: Reservation) -> bool:
@@ -673,6 +688,10 @@ class SlurmController:
         try:
             exists = self._reservation_exists(reservation.name)
         except subprocess.CalledProcessError:
+            logger.error(f"Unable to check if reservation '{reservation.name}' exists due to command failure")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error checking reservation existence: {e}")
             return False
 
         action = "Updating" if exists else "Creating"
