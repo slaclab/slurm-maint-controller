@@ -927,7 +927,7 @@ def main(
         sys.stdout,
         level=log_level,
         colorize=True,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+        format="<cyan>{time:YYYY-MM-DDTHH:mm:ss}</cyan> | <level>{level: <8}</level> | <level>{message}</level>",
     )
     logger.info("Starting Slurm Reservation Manager")
 
