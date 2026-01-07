@@ -20,6 +20,12 @@ start-app:
 test:
 	$(ENVIRONMENT)/bin/python3 controller.py --dry-run --log-level=DEBUG
 
+tests:
+	@echo "Running test suite..."
+	$(ENVIRONMENT)/bin/python3 tests/test_node_states.py
+	$(ENVIRONMENT)/bin/python3 tests/test_node_counting.py
+	@echo "All tests completed!"
+
 # dockerhub-login:
 # 	$(CONTAINER_RT) login --username $(DOCKERHUB_USERNAME) $(CONTAINER_PREFIX)/$(CONTAINER_NAME)
 

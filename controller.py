@@ -328,6 +328,36 @@ class Reservation:
             f"duration {self._format_duration()}"
         )
 
+def expand_slurm_nodelist(nodelist: str) -> Tuple[str, ...]:
+    """
+    Expand a Slurm nodelist into individual node names using scontrol.
+
+    Args:
+        nodelist: Slurm nodelist string (e.g., "node[1-3,5]" or "node1,node2")
+
+    Returns:
+        Tuple of individual node names.
+    """
+    try:
+        result = subprocess.run(
+            ["scontrol", "show", "hostnames", nodelist],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        nodes = tuple(
+            node.strip()
+            for node in result.stdout.strip().split("\n")
+            if node.strip()
+        )
+        logger.debug(f"Expanded Slurm nodelist '{nodelist}' to {len(nodes)} nodes")
+        return nodes
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Failed to expand Slurm nodelist '{nodelist}': {e.stderr}")
+        # Fall back to treating it as a single node name
+        return (nodelist,)
+
+
 def expand_node_spec(node_spec: str) -> Tuple[str, ...]:
     """
     Expand a Slurm-style node expression into a tuple of node names.
@@ -728,7 +758,7 @@ def parse_duration_string(time_str: str) -> pendulum.Duration:
 
 
 def run_reservation_manager(
-    nodes: Tuple[str, ...],
+    nodelist: Tuple[str, ...],
     duration: str,
     user: Optional[str],
     account: Optional[str],
@@ -751,7 +781,7 @@ def run_reservation_manager(
     4. Creates or updates a maintenance reservation for the specified duration
 
     Args:
-        nodes: Tuple of node specifications (e.g., 'node[1-10]'). If empty, uses all cluster nodes.
+        nodelist: Tuple of Slurm nodelist specifications (e.g., 'node[1-10]'). If empty, uses all cluster nodes.
         duration: Duration string in HH:MM:SS format for the reservation length.
         user: Username(s) to associate with the reservation.
         account: Account(s) to associate with the reservation.
@@ -768,12 +798,13 @@ def run_reservation_manager(
     controller = SlurmController(dry_run=dry_run)
     node_names = []
 
-    if nodes:
+    if nodelist:
         expanded_nodes: List[str] = []
-        for node_spec in nodes:
+        for node_spec in nodelist:
             try:
-                expanded = expand_node_spec(node_spec)
-            except ValueError as exc:
+                # Use expand_slurm_nodelist for proper Slurm nodelist expansion
+                expanded = expand_slurm_nodelist(node_spec)
+            except Exception as exc:
                 logger.error(
                     f"Failed to expand node specification '{node_spec}': {exc}"
                 )
@@ -782,7 +813,7 @@ def run_reservation_manager(
                 logger.warning(f"No nodes matched specification '{node_spec}'")
             expanded_nodes.extend(expanded)
         node_names = list(dict.fromkeys(expanded_nodes))
-        if not nodes:
+        if not node_names:
             logger.warning("No valid nodes derived from user input; exiting.")
             return
         logger.info(f"Using user-specified nodes: {', '.join(node_names)}")
@@ -866,10 +897,10 @@ def run_reservation_manager(
 
 @click.command()
 @click.option(
-    "--nodes",
+    "--nodelist",
     "-n",
     multiple=True,
-    help="Specific node(s) to consider (can be provided multiple times)",
+    help="Slurm nodelist specification (e.g., 'node[1-10,15]', can be provided multiple times)",
 )
 @click.option(
     "--duration",
@@ -907,7 +938,7 @@ def run_reservation_manager(
 
 # main
 def main(
-    nodes: Tuple[str, ...],
+    nodelist: Tuple[str, ...],
     duration: str,
     user: Optional[str],
     account: Optional[str],
@@ -932,7 +963,7 @@ def main(
     logger.info("Starting Slurm Reservation Manager")
 
     run_reservation_manager(
-        nodes=nodes,
+        nodelist=nodelist,
         duration=duration,
         user=user,
         account=account,
