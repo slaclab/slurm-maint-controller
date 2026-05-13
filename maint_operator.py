@@ -201,7 +201,7 @@ class Reservation:
     """
 
     name: str
-    nodes: list[str]
+    nodes: List[str]
     start_time: pendulum.DateTime
     duration: pendulum.Duration
     user: Optional[str] = None
