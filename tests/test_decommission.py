@@ -57,8 +57,9 @@ def test_full_decommission_lifecycle():
     # Second call is idempotent
     assert manager.mark_node_for_decommission("node01", "compute") is False
 
-    # Drain completes: operator issues shutdown → node is now waiting for revival
-    manager.issue_shutdown("node01")
+    # Drain completes: reboot command issued, then state parked at AWAITING_REVIVAL
+    manager.issue_reboot("node01")
+    manager.node_reboot_status["node01"].state = RebootState.AWAITING_REVIVAL
     assert manager.node_reboot_status["node01"].state == RebootState.AWAITING_REVIVAL
     _, _, unavailable = manager.count_unavailable_nodes("compute")
     assert "node01" in unavailable, "AWAITING_REVIVAL node must count as unavailable"
@@ -70,16 +71,20 @@ def test_full_decommission_lifecycle():
     )
     assert manager.mark_node_for_revival("node02") is False
 
-    # Hardware is restored: operator triggers revival → transitions to REBOOTING
+    # Hardware is restored: operator triggers revival → back to PENDING for reboot pipeline
     assert manager.mark_node_for_revival("node01") is True
+    assert manager.node_reboot_status["node01"].state == RebootState.PENDING
+
+    # Reboot pipeline picks it up (issue_reboot) and recovery monitoring completes it
+    manager.issue_reboot("node01")
     assert manager.node_reboot_status["node01"].state == RebootState.REBOOTING
-    assert manager.node_reboot_status["node01"].attempts == 1
+    assert manager.node_reboot_status["node01"].attempts == 2  # shutdown + revival
 
     # Recovery monitoring marks the node done
     manager.complete_node_reboot("node01")
     assert manager.node_reboot_status["node01"].state == RebootState.COMPLETED
 
-    print("  ✓ PENDING → AWAITING_REVIVAL → REBOOTING → COMPLETED")
+    print("  ✓ PENDING → AWAITING_REVIVAL → PENDING → REBOOTING → COMPLETED")
     print("  ✓ Node counted as unavailable in PENDING and AWAITING_REVIVAL states")
     print("  ✓ Revival on wrong state is a no-op")
     print()

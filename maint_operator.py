@@ -1084,7 +1084,12 @@ class MaintenanceManager:
         return True
 
     def mark_node_for_revival(self, node_name: str) -> bool:
-        """Trigger revival of a decommissioned node (AWAITING_REVIVAL → REBOOTING)."""
+        """Re-queue a decommissioned node for revival (AWAITING_REVIVAL → PENDING).
+
+        The node re-enters the existing reboot pipeline: issue_reboot() brings
+        it back up and monitor_node_recovery() confirms recovery — no separate
+        stub required.
+        """
         if node_name not in self.node_reboot_status:
             logger.error(
                 f"Node '{node_name}' not found in tracking — cannot revive unknown node"
@@ -1099,7 +1104,9 @@ class MaintenanceManager:
             )
             return False
 
-        return self.issue_revival(node_name)
+        status.state = RebootState.PENDING
+        logger.info(f"Node '{node_name}' queued for revival via reboot pipeline")
+        return True
 
     def issue_reboot(self, node_name: str) -> bool:
         """Issue a reboot command to a node."""
@@ -1160,55 +1167,6 @@ class MaintenanceManager:
                 return False
 
         return False
-
-    def issue_shutdown(self, node_name: str) -> bool:
-        """Issue a shutdown command to a node for hardware decommission."""
-        if node_name not in self.node_reboot_status:
-            logger.error(f"Node '{node_name}' not found in reboot status tracking")
-            return False
-
-        status = self.node_reboot_status[node_name]
-
-        if status.state != RebootState.PENDING:
-            logger.warning(
-                f"Node '{node_name}' is not in PENDING state (current: {status.state.value})"
-            )
-            return False
-
-        # STUB: This is where you would actually issue the shutdown command (e.g. IPMI, PDU, SSH halt)
-        logger.info(f"[STUB] Issuing shutdown command to node '{node_name}'")
-
-        status.state = RebootState.AWAITING_REVIVAL
-        status.reboot_start_time = datetime.now()
-
-        logger.info(f"Node '{node_name}' shut down — awaiting revival command")
-        return True
-
-    def issue_revival(self, node_name: str) -> bool:
-        """Issue a power-on command to a decommissioned node."""
-        if node_name not in self.node_reboot_status:
-            logger.error(f"Node '{node_name}' not found in reboot status tracking")
-            return False
-
-        status = self.node_reboot_status[node_name]
-
-        if status.state != RebootState.AWAITING_REVIVAL:
-            logger.warning(
-                f"Node '{node_name}' is not in AWAITING_REVIVAL state (current: {status.state.value})"
-            )
-            return False
-
-        # STUB: This is where you would actually issue the power-on command
-        logger.info(f"[STUB] Issuing revival (power-on) command to node '{node_name}'")
-
-        status.state = RebootState.REBOOTING
-        status.reboot_start_time = datetime.now()
-        status.attempts += 1
-
-        logger.info(
-            f"Node '{node_name}' revival initiated (attempt {status.attempts}/{status.max_attempts})"
-        )
-        return True
 
     def complete_node_reboot(self, node_name: str) -> bool:
         """Mark a node reboot as completed."""
@@ -1679,10 +1637,8 @@ def run_operator(
                         current_percentage = (combined_count / total_count) * 100
                         if current_percentage < max_down_percentage:
                             status = manager.node_reboot_status[node_name]
-                            if status.maintenance_type == "decommission":
-                                manager.issue_shutdown(node_name)
-                            else:
-                                manager.issue_reboot(node_name)
+                            if manager.issue_reboot(node_name) and status.maintenance_type == "decommission":
+                                status.state = RebootState.AWAITING_REVIVAL
                         else:
                             logger.debug(
                                 f"Deferring reboot of '{node_name}' due to rate limit"
