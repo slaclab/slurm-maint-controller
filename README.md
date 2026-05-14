@@ -4,10 +4,11 @@
 
 ## What It Does
 
-The operator combines two key functions:
+The operator combines three key functions:
 
 1. **Creates maintenance reservations** for nodes based on running jobs, automatically scheduling reservations to start after jobs complete
 2. **Orchestrates rolling reboots** of nodes while ensuring that no more than a specified percentage of nodes are unavailable at any time
+3. **Manages hardware decommission and revival** — gracefully drains and shuts down nodes on hardware being shutdown, then re-integrates them when the hardware is restored
 
 ### Node Availability Management
 
@@ -47,31 +48,46 @@ The operator maintains a state machine for each node being rebooted:
 ```
 Node Discovery
     ↓
-PENDING_REBOOT ──capacity available──> REBOOTING ──node down──> RECOVERING ──node up──> COMPLETED
-                                           │                          │
-                                           └──timeout──> FAILED       └──timeout──> FAILED
+PENDING ──capacity available──> REBOOTING ──node down──> RECOVERING ──node up──> COMPLETED
+                                    │                         │
+                                    └──timeout──> FAILED      └──timeout──> FAILED
+```
+
+**Decommission variant** (nodes on hardware being permanently retired):
+
+```
+mark_node_for_decommission()
+    ↓
+PENDING ──capacity available──> REBOOTING ──(decommission branch)──> AWAITING_REVIVAL
+                                                                             │
+                                                              mark_node_for_revival()
+                                                                             │
+                                                                             ↓
+                                                                         PENDING ──> REBOOTING ──> COMPLETED
 ```
 
 **State Descriptions:**
 
-- **PENDING_REBOOT**: Node identified for reboot, queued and waiting for capacity to become available
-- **REBOOTING**: Reboot command issued, waiting for node to go down (become unreachable)
+- **PENDING**: Node identified for reboot (or decommission drain), queued and waiting for capacity to become available
+- **REBOOTING**: Reboot command issued, waiting for node to go down
 - **RECOVERING**: Node is down, waiting for it to come back up and return to service
+- **AWAITING_REVIVAL**: Node has been shut down for hardware decommission; paused here until the operator is told the hardware is restored (via `--revive`)
 - **COMPLETED**: Node has successfully rebooted and is back in service, verified via Slurm state
 - **FAILED**: Reboot timed out or failed after maximum retry attempts (default: 3 attempts)
 
 **State Transitions:**
 
-1. New nodes are discovered in maintenance reservations and marked as **PENDING_REBOOT**
+1. New nodes are discovered in maintenance reservations and marked as **PENDING**
 2. When capacity is available (under `max-down-percentage`), the operator transitions the node to **REBOOTING** and issues the reboot command
-3. The operator monitors for the node to go down (become unreachable), then transitions to **RECOVERING**
-4. Once the node comes back online and Slurm reports it as healthy, it transitions to **COMPLETED**
-5. If any step times out (default: 600 seconds), the node may retry or transition to **FAILED**
+3. For standard reboots, the operator monitors for the node to go down, then transitions to **RECOVERING**
+4. For decommission nodes, after the reboot command the node is parked at **AWAITING_REVIVAL** rather than entering the recovery pipeline
+5. Once the node comes back online and Slurm reports it as healthy, it transitions to **COMPLETED**
+6. If any step times out (default: 600 seconds), the node may retry or transition to **FAILED**
 
 **Retry Logic:**
 
 - Each node gets up to 3 reboot attempts
-- Failed attempts return the node to **PENDING_REBOOT** for retry
+- Failed attempts return the node to **PENDING** for retry
 - After 3 failures, the node is marked as **FAILED** and requires manual intervention
 
 ## Understanding Node Availability
@@ -86,7 +102,7 @@ Nodes that are **not actively being used by Slurm for jobs** due to maintenance 
 
 - **Nodes with active maintenance reservations** - Currently in a maintenance reservation
 - **Nodes with reservations starting soon** - Within the `--reservation-lead-time` window (default: 60 minutes)
-- **Nodes being rebooted** - In `PENDING_REBOOT`, `REBOOTING`, or `RECOVERING` states
+- **Nodes being rebooted** - In `PENDING`, `REBOOTING`, `RECOVERING`, or `AWAITING_REVIVAL` states
 - **Nodes managed by this operator** - Tracked in the state file
 
 #### DOWN Nodes
@@ -230,6 +246,7 @@ python maint_operator.py -p compute --enable-reservations --enable-reboots --onc
 #### Operational Control
 - `--enable-reservations` - Enable creation of maintenance reservations (default: disabled)
 - `--enable-reboots` - Enable actual reboot processing (default: disabled)
+- `--enable-decommission` - Enable decommission and revival processing (safety gate, like `--enable-reboots`)
 - `--terminate-preemptable-jobs` - Allow termination of preemptable jobs (default: disabled)
 - `--dry-run` - Don't actually create reservations or terminate jobs (default: disabled)
 
@@ -250,6 +267,8 @@ python maint_operator.py -p compute --enable-reservations --enable-reboots --onc
 
 #### Node Selection
 - `--nodelist TEXT` - Filter nodes by Slurm nodelist format (e.g., node[1-10,15]). Default: all nodes
+- `--decommission` - Treat `--nodelist` nodes as hardware decommission targets (drain → shutdown → await revival). Requires `--enable-decommission`
+- `--revive` - Trigger revival for `--nodelist` nodes currently in `AWAITING_REVIVAL` state. Requires `--enable-decommission`
 
 #### Reboot Configuration
 - `--reboot-timeout INTEGER` - Timeout in seconds to wait for a node to come back up (default: 600)
@@ -275,6 +294,7 @@ The state file (default: `/var/tmp/slurm-maint-{partition}.json`) contains:
       "node_name": "node001",
       "state": "REBOOTING",
       "partition": "compute",
+      "maintenance_type": "reboot",
       "marked_time": "2024-01-15T10:30:00Z",
       "reboot_start_time": "2024-01-15T10:32:00Z",
       "reboot_complete_time": null,
@@ -287,7 +307,8 @@ The state file (default: `/var/tmp/slurm-maint-{partition}.json`) contains:
 
 **Tracked Information:**
 - Node name and partition
-- Current reboot state (PENDING_REBOOT, REBOOTING, RECOVERING, COMPLETED, FAILED)
+- Current reboot state (`pending`, `rebooting`, `recovering`, `awaiting_revival`, `completed`, `failed`)
+- Maintenance type (`reboot` for standard rolling reboots; `decommission` for hardware being retired) — defaults to `reboot`
 - Timestamps for state transitions
 - Number of reboot attempts and maximum allowed
 - When the node was marked for reboot
@@ -366,6 +387,7 @@ The operator consists of several key classes working together:
 
 4. **NodeRebootStatus** - Tracks individual node reboot state
    - State transitions through reboot lifecycle
+   - `maintenance_type` field (`MaintananceType.REBOOT` or `MaintananceType.DECOMMISSION`) labels the intent
    - Retry counting and timeout tracking
    - Serialization for state persistence
 
@@ -449,6 +471,84 @@ The operator includes multiple safety mechanisms:
 6. **Use appropriate timeouts**: Adjust `--reboot-timeout` based on your nodes' typical boot time
 7. **Handle preemptable jobs carefully**: Only use `--terminate-preemptable-jobs` if your workload supports it
 8. **Set realistic reservation durations**: Ensure `--reservation-duration` is long enough for reboots to complete
+
+## Hardware Decommission and Revival
+
+Use this workflow when nodes must be retired from hardware that is being discontinued/taken down for maintanence, then later re-integrated when the hardware is restored.
+
+### Overview
+
+The decommission workflow reuses the same reservation-drain pipeline as rolling reboots. The only difference is that after the node is shut down it parks in `AWAITING_REVIVAL` instead of entering the recovery pipeline. When the hardware is restored, the operator is manually told to revive the node and it re-enters the standard reboot pipeline.
+
+```
+Operator flags node for decommission (--decommission)
+    ↓
+PENDING  ←── same as normal reboot ───
+    ↓ (Phase 2: drain complete, capacity available)
+REBOOTING  ──> node shut down  ──>  AWAITING_REVIVAL  (parked here until hardware restored)
+                                           │
+                          Operator flags revival (--revive)
+                                           │
+                                       PENDING
+                                           ↓
+                                      REBOOTING ──> COMPLETED
+```
+
+The node is counted as **unavailable** (and therefore against `--max-down-percentage`) in both `PENDING` and `AWAITING_REVIVAL` states. This prevents other work from filling the capacity headroom while the hardware is being serviced.
+
+### Step-by-Step
+
+#### 1. Flag nodes for decommission
+
+```bash
+# Drain and shut down node001, node002 from the compute partition
+python maint_operator.py \
+  -p compute \
+  --nodelist "node[001-002]" \
+  --enable-reservations \
+  --enable-reboots \
+  --enable-decommission \
+  --decommission \
+  -v
+```
+
+The operator will:
+- Create maintenance reservations for the nodes (draining jobs normally)
+- When drained, issue the shutdown command via `issue_reboot()`
+- Park the nodes in `AWAITING_REVIVAL` — they will not be monitored for recovery
+
+#### 2. Check which nodes are awaiting revival
+
+```bash
+cat /var/tmp/slurm-maint-compute.json | \
+  jq '.nodes | map(select(.state == "awaiting_revival")) | .[].node_name'
+```
+
+#### 3. Restore hardware and trigger revival
+
+Once the hardware is back and the nodes are powered on:
+
+```bash
+python maint_operator.py \
+  -p compute \
+  --nodelist "node[001-002]" \
+  --enable-reboots \
+  --enable-decommission \
+  --revive \
+  -v
+```
+
+The operator will:
+- Transition nodes from `AWAITING_REVIVAL` → `PENDING`
+- On the next pass, issue the reboot command and monitor recovery normally
+- Nodes return to `COMPLETED` once Slurm reports them healthy
+
+### Safety Notes
+
+- `--enable-decommission` is a required safety gate (analogous to `--enable-reboots`); without it `--decommission` and `--revive` are no-ops
+- `--decommission` and `--revive` are mutually exclusive — `--revive` takes precedence if both are passed
+- `mark_node_for_decommission()` is idempotent: calling it again on a node already in the pipeline is a no-op
+- `mark_node_for_revival()` will refuse (log a warning and return False) if the node is not in `AWAITING_REVIVAL` state — preventing accidental early revival
 
 ## Example Workflows
 
@@ -589,7 +689,7 @@ watch -n 10 'sinfo -p compute'
 ```
 
 #### Key Metrics to Track
-- Number of nodes in each state (PENDING, REBOOTING, RECOVERING, COMPLETED, FAILED)
+- Number of nodes in each state (PENDING, REBOOTING, RECOVERING, AWAITING_REVIVAL, COMPLETED, FAILED)
 - Current unavailable/down percentage
 - Number of active maintenance reservations
 - Time to complete full rolling reboot

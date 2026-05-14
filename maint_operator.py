@@ -38,6 +38,11 @@ from loguru import logger
 # ==================== Data Classes ====================
 
 
+class MaintananceType(Enum):
+    REBOOT = "reboot"
+    DECOMMISSION = "decommission"
+
+
 @dataclass
 class PartitionInfo:
     """Information about a Slurm partition and its nodes."""
@@ -125,21 +130,23 @@ class JobInfo:
 
 
 class RebootState(Enum):
-    """States for node reboot tracking."""
+    """States for node reboot/decommission tracking."""
 
     PENDING = "pending"
     REBOOTING = "rebooting"
     COMPLETED = "completed"
     FAILED = "failed"
+    AWAITING_REVIVAL = "awaiting_revival"
 
 
 @dataclass
 class NodeRebootStatus:
-    """Tracks the reboot status of a node."""
+    """Tracks the reboot/decommission status of a node."""
 
     node_name: str
     partition: str
     state: RebootState
+    maintenance_type: MaintananceType = MaintananceType.REBOOT
     reboot_start_time: Optional[datetime] = None
     reboot_complete_time: Optional[datetime] = None
     attempts: int = 0
@@ -151,6 +158,7 @@ class NodeRebootStatus:
             "node_name": self.node_name,
             "partition": self.partition,
             "state": self.state.value,
+            "maintenance_type": self.maintenance_type.value,
             "reboot_start_time": self.reboot_start_time.isoformat()
             if self.reboot_start_time
             else None,
@@ -168,6 +176,7 @@ class NodeRebootStatus:
             node_name=data["node_name"],
             partition=data["partition"],
             state=RebootState(data["state"]),
+            maintenance_type=MaintananceType(data.get("maintenance_type", "reboot")),
             reboot_start_time=datetime.fromisoformat(data["reboot_start_time"])
             if data["reboot_start_time"]
             else None,
@@ -955,6 +964,7 @@ class MaintenanceManager:
                 if status.partition == partition and status.state in [
                     RebootState.REBOOTING,
                     RebootState.PENDING,
+                    RebootState.AWAITING_REVIVAL,
                 ]:
                     unavailable_nodes.add(node_name)
 
@@ -1052,6 +1062,50 @@ class MaintenanceManager:
             node_name=node_name, partition=partition, state=RebootState.PENDING
         )
         logger.info(f"Marked node '{node_name}' (partition: {partition}) for reboot")
+        return True
+
+    def mark_node_for_decommission(self, node_name: str, partition: str) -> bool:
+        """Mark a node for hardware decommission (drain → shutdown → await revival)."""
+        if node_name in self.node_reboot_status:
+            status = self.node_reboot_status[node_name]
+            if status.state not in [RebootState.COMPLETED, RebootState.FAILED]:
+                logger.debug(
+                    f"Node '{node_name}' already tracked (state: {status.state.value}), skipping"
+                )
+                return False
+
+        self.node_reboot_status[node_name] = NodeRebootStatus(
+            node_name=node_name,
+            partition=partition,
+            state=RebootState.PENDING,
+            maintenance_type=MaintananceType.DECOMMISSION,
+        )
+        logger.info(f"Marked node '{node_name}' (partition: {partition}) for decommission")
+        return True
+
+    def mark_node_for_revival(self, node_name: str) -> bool:
+        """Re-queue a decommissioned node for revival (AWAITING_REVIVAL → PENDING).
+
+        The node re-enters the existing reboot pipeline: issue_reboot() brings
+        it back up and monitor_node_recovery() confirms recovery — no separate
+        stub required.
+        """
+        if node_name not in self.node_reboot_status:
+            logger.error(
+                f"Node '{node_name}' not found in tracking — cannot revive unknown node"
+            )
+            return False
+
+        status = self.node_reboot_status[node_name]
+        if status.state != RebootState.AWAITING_REVIVAL:
+            logger.warning(
+                f"Node '{node_name}' is not in AWAITING_REVIVAL state "
+                f"(current: {status.state.value}) — skipping revival"
+            )
+            return False
+
+        status.state = RebootState.PENDING
+        logger.info(f"Node '{node_name}' queued for revival via reboot pipeline")
         return True
 
     def issue_reboot(self, node_name: str) -> bool:
@@ -1228,6 +1282,9 @@ def run_operator(
     user: Optional[str],
     account: Optional[str],
     flags: Optional[str],
+    decommission: bool = False,
+    revive: bool = False,
+    enable_decommission: bool = False,
 ) -> None:
     """
     Main operator loop that creates reservations and manages reboots.
@@ -1252,6 +1309,9 @@ def run_operator(
     logger.info(f"  Reboot timeout: {reboot_timeout}s")
     logger.info(f"  Reservations enabled: {enable_reservations}")
     logger.info(f"  Reboots enabled: {enable_reboots}")
+    logger.info(f"  Decommission mode: {decommission}")
+    logger.info(f"  Revival mode: {revive}")
+    logger.info(f"  Decommission enabled: {enable_decommission}")
     logger.info(f"  Terminate preemptable: {terminate_preemptable_jobs}")
     logger.info(f"  Dry run: {dry_run}")
 
@@ -1273,6 +1333,15 @@ def run_operator(
                 break
 
             logger.info(f"--- Iteration {iteration} ---")
+
+            # Seed decommission/revival state from nodelist flags (idempotent)
+            if enable_decommission:
+                if revive:
+                    for node_name in target_nodes:
+                        manager.mark_node_for_revival(node_name)
+                elif decommission:
+                    for node_name in target_nodes:
+                        manager.mark_node_for_decommission(node_name, partition)
 
             # Get current maintenance reservations
             existing_reservations = manager.get_maintenance_reservations()
@@ -1567,7 +1636,9 @@ def run_operator(
                     if total_count > 0:
                         current_percentage = (combined_count / total_count) * 100
                         if current_percentage < max_down_percentage:
-                            manager.issue_reboot(node_name)
+                            status = manager.node_reboot_status[node_name]
+                            if manager.issue_reboot(node_name) and status.maintenance_type == MaintananceType.DECOMMISSION:
+                                status.state = RebootState.AWAITING_REVIVAL
                         else:
                             logger.debug(
                                 f"Deferring reboot of '{node_name}' due to rate limit"
@@ -1723,6 +1794,21 @@ def run_operator(
     help="Enable actual reboot processing",
 )
 @click.option(
+    "--decommission",
+    is_flag=True,
+    help="Treat --nodelist nodes as hardware decommission targets (drain → shutdown → await revival)",
+)
+@click.option(
+    "--revive",
+    is_flag=True,
+    help="Trigger revival for --nodelist nodes currently in AWAITING_REVIVAL state",
+)
+@click.option(
+    "--enable-decommission",
+    is_flag=True,
+    help="Enable decommission and revival processing (safety gate, like --enable-reboots)",
+)
+@click.option(
     "--terminate-preemptable-jobs",
     is_flag=True,
     help="Allow termination of preemptable jobs",
@@ -1772,6 +1858,9 @@ def main(
     reboot_timeout: int,
     enable_reservations: bool,
     enable_reboots: bool,
+    decommission: bool,
+    revive: bool,
+    enable_decommission: bool,
     terminate_preemptable_jobs: bool,
     dry_run: bool,
     state_file: Optional[str],
@@ -1875,6 +1964,9 @@ def main(
         user=user,
         account=account,
         flags=flags,
+        decommission=decommission,
+        revive=revive,
+        enable_decommission=enable_decommission,
     )
 
 

@@ -1,0 +1,73 @@
+@startuml
+skinparam state {
+  ' States for normal, in-progress workflow
+  BackgroundColor<<inprogress>> #E3F2FD
+  BorderColor<<inprogress>> #1565C0
+
+  ' State for successful completion
+  BackgroundColor<<success>> #E8F5E9
+  BorderColor<<success>> #2E7D32
+
+  ' State for failed operations
+  BackgroundColor<<failure>> #FFEBEE
+  BorderColor<<failure>> #B71C1C
+
+  ' Original user-defined states
+  BackgroundColor<<decommission>> #FFE0B2
+  BorderColor<<decommission>> #E65100
+  BackgroundColor<<choice>> #F3E5F5
+  BorderColor<<choice>> #6A1B9A
+  BackgroundColor<<external>> #F5F5F5
+  BorderColor<<external>> #9E9E9E
+}
+
+[*] --> UNTRACKED
+
+state UNTRACKED<<external>> : Node is active in partition,\nrunning jobs normally,\nnot tracked by operator
+
+state entry_branch<<choice>>
+UNTRACKED --> entry_branch
+
+entry_branch --> RESERVATION_PENDING  : [--enable-reservations]\nPhase 1: no existing reservation\nfound for node
+entry_branch --> PENDING              : [--decommission]\nmark_node_for_decommission()
+
+state RESERVATION_PENDING<<inprogress>> : Calculating reservation start time\nbased on running jobs:\n- no jobs → start now\n- preemptable jobs → after longest\n- regular jobs → after longest
+
+RESERVATION_PENDING --> DRAINING      : Reservation created\n(scontrol create reservation\nmaint:{node_name})
+
+state DRAINING<<inprogress>> : Reservation active; Slurm blocks\nnew jobs. Existing jobs run to\ncompletion. Node unavailable\nto the scheduler.
+
+DRAINING --> PENDING                  : All jobs drained\n(or preemptable jobs\nterminated via --terminate-\npreemptable-jobs)
+
+state PENDING<<inprogress>> : Queued for reboot.\nWaiting for capacity:\ncombined unavailable+down\n< --max-down-percentage
+
+PENDING --> REBOOTING                 : Capacity available\n(issue_reboot())
+
+state REBOOTING<<inprogress>> : Reboot command issued.\nAwaiting node shutdown.
+
+state fork<<choice>>
+REBOOTING --> fork                    : Node goes down
+
+fork --> RECOVERING                   : [maintenance_type == REBOOT]
+fork --> AWAITING_REVIVAL             : [maintenance_type == DECOMMISSION]
+
+state RECOVERING<<inprogress>> : Node is down. Polling for\nreturn to service via\nmonitor_node_recovery().
+
+state AWAITING_REVIVAL<<decommission>> : Hardware retired.\nParked indefinitely; no timeout.\nStill counts as unavailable.
+
+RECOVERING --> COMPLETED              : Node back online;\nSlurm reports healthy
+RECOVERING --> FAILED                 : Timeout exceeded
+
+REBOOTING --> FAILED                  : Timeout exceeded
+
+AWAITING_REVIVAL --> DRAINING         : mark_node_for_revival()\n(<U+002D><U+002D>revive <U+002D><U+002D>nodelist)
+
+state FAILED<<failure>> : Reboot attempt failed.\nAttempt counter incremented.
+
+FAILED --> PENDING                    : [attempts < max_attempts]\nauto-retry
+FAILED --> [*]                        : [attempts == max_attempts]\nmanual intervention required
+
+state COMPLETED<<success>> : Node healthy and back\nin Slurm service.
+COMPLETED --> UNTRACKED               : State file entry\nexpires after 24h
+
+@enduml

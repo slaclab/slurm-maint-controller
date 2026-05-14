@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slurm-maint-controller"
+version = "0.1.0"
+description = "SLURM Controller for Managing Nodes during Maintanence"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "loguru==0.7.3",
+    "click==8.3.3",
+    "pendulum==3.2.0"
+]
+
+[dependency-groups]
+dev = [
+    {include-group = "test"}
+]
+test = [
+    "pytest>=9.0.3",
+]
+
+[project.scripts]
+slurm-maint = "maint_operator:main"
+
+# Test configuration
+[tool.pytest]
+testpaths = ["tests"]
+addopts = [
+    "-v",
+]
