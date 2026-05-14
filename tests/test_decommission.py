@@ -8,6 +8,7 @@ from datetime import datetime
 from unittest.mock import Mock
 
 from maint_operator import (
+    MaintananceType,
     MaintenanceManager,
     NodeRebootStatus,
     PartitionInfo,
@@ -50,7 +51,7 @@ def test_full_decommission_lifecycle():
     # Seed: node is staged for decommission and shows up as unavailable
     manager.mark_node_for_decommission("node01", "compute")
     assert manager.node_reboot_status["node01"].state == RebootState.PENDING
-    assert manager.node_reboot_status["node01"].maintenance_type == "decommission"
+    assert manager.node_reboot_status["node01"].maintenance_type == MaintananceType.DECOMMISSION
     _, _, unavailable = manager.count_unavailable_nodes("compute")
     assert "node01" in unavailable, "PENDING decommission node must count as unavailable"
 
@@ -67,7 +68,7 @@ def test_full_decommission_lifecycle():
     # Revival on wrong state is a no-op (guard against accidental calls)
     manager.node_reboot_status["node02"] = NodeRebootStatus(
         node_name="node02", partition="compute", state=RebootState.PENDING,
-        maintenance_type="decommission",
+        maintenance_type=MaintananceType.DECOMMISSION,
     )
     assert manager.mark_node_for_revival("node02") is False
 
@@ -101,7 +102,7 @@ def test_serialisation_roundtrip_and_backward_compat():
         node_name="node01",
         partition="compute",
         state=RebootState.AWAITING_REVIVAL,
-        maintenance_type="decommission",
+        maintenance_type=MaintananceType.DECOMMISSION,
         reboot_start_time=datetime(2026, 5, 13, 10, 0, 0),
         attempts=2,
     )
@@ -109,13 +110,13 @@ def test_serialisation_roundtrip_and_backward_compat():
     restored = NodeRebootStatus.from_dict(data)
 
     assert restored.state == RebootState.AWAITING_REVIVAL
-    assert restored.maintenance_type == "decommission"
+    assert restored.maintenance_type == MaintananceType.DECOMMISSION
     assert restored.attempts == 2
 
     # Old state file: no maintenance_type key → defaults to "reboot"
     old_data = {k: v for k, v in data.items() if k != "maintenance_type"}
     old_status = NodeRebootStatus.from_dict(old_data)
-    assert old_status.maintenance_type == "reboot"
+    assert old_status.maintenance_type == MaintananceType.REBOOT
 
     print("  ✓ Round-trip preserves maintenance_type and AWAITING_REVIVAL state")
     print("  ✓ Old state files without maintenance_type default to 'reboot'")

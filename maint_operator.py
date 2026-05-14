@@ -158,7 +158,7 @@ class NodeRebootStatus:
             "node_name": self.node_name,
             "partition": self.partition,
             "state": self.state.value,
-            "maintenance_type": self.maintenance_type,
+            "maintenance_type": self.maintenance_type.value,
             "reboot_start_time": self.reboot_start_time.isoformat()
             if self.reboot_start_time
             else None,
@@ -176,7 +176,7 @@ class NodeRebootStatus:
             node_name=data["node_name"],
             partition=data["partition"],
             state=RebootState(data["state"]),
-            maintenance_type=data.get("maintenance_type", "reboot"),
+            maintenance_type=MaintananceType(data.get("maintenance_type", "reboot")),
             reboot_start_time=datetime.fromisoformat(data["reboot_start_time"])
             if data["reboot_start_time"]
             else None,
@@ -1078,7 +1078,7 @@ class MaintenanceManager:
             node_name=node_name,
             partition=partition,
             state=RebootState.PENDING,
-            maintenance_type="decommission",
+            maintenance_type=MaintananceType.DECOMMISSION,
         )
         logger.info(f"Marked node '{node_name}' (partition: {partition}) for decommission")
         return True
@@ -1637,7 +1637,7 @@ def run_operator(
                         current_percentage = (combined_count / total_count) * 100
                         if current_percentage < max_down_percentage:
                             status = manager.node_reboot_status[node_name]
-                            if manager.issue_reboot(node_name) and status.maintenance_type == "decommission":
+                            if manager.issue_reboot(node_name) and status.maintenance_type == MaintananceType.DECOMMISSION:
                                 status.state = RebootState.AWAITING_REVIVAL
                         else:
                             logger.debug(
