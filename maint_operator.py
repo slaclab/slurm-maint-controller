@@ -585,19 +585,19 @@ class ReservationManager:
         else:
             return self.create(reservation)
 
-    def delete(self, reservation: Reservation) -> bool:
+    def delete(self, reservation_name: str) -> bool:
         """
-        Delete a reservation from Slurm.
+        Delete a reservation from Slurm by name.
 
         Args:
-            reservation: Reservation object to delete
+            reservation_name: Name of the reservation to delete
 
         Returns:
-            True if successful, False otherwise
+            True if successful (or already gone), False on unexpected error
         """
-        cmd = ["scontrol", "delete", "reservation", reservation.name]
+        cmd = ["scontrol", "delete", "reservation", reservation_name]
 
-        logger.info(f"Deleting reservation: {reservation.name}")
+        logger.info(f"Deleting reservation: {reservation_name}")
         logger.debug(f"Command: {' '.join(cmd)}")
 
         if self.dry_run:
@@ -606,10 +606,15 @@ class ReservationManager:
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            logger.success(f"Reservation deleted successfully")
+            logger.success(f"Reservation '{reservation_name}' deleted successfully")
             return True
         except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to delete reservation: {e.stderr}")
+            # Treat "not found" as success — reservation already gone
+            stderr_lower = e.stderr.lower()
+            if "not found" in stderr_lower or "invalid reservation" in stderr_lower:
+                logger.debug(f"Reservation '{reservation_name}' already gone, nothing to delete")
+                return True
+            logger.error(f"Failed to delete reservation '{reservation_name}': {e.stderr}")
             return False
 
 
@@ -1169,7 +1174,7 @@ class MaintenanceManager:
         return False
 
     def complete_node_reboot(self, node_name: str) -> bool:
-        """Mark a node reboot as completed."""
+        """Mark a node reboot as completed and release its maintenance reservation."""
         if node_name not in self.node_reboot_status:
             return False
 
@@ -1178,6 +1183,12 @@ class MaintenanceManager:
         status.reboot_complete_time = datetime.now()
 
         logger.success(f"Node '{node_name}' reboot completed successfully")
+
+        # Release the maintenance reservation so Slurm can schedule jobs immediately
+        res_name = f"maint:{node_name}"
+        if self.reservation_manager.exists(res_name):
+            self.reservation_manager.delete(res_name)
+
         return True
 
     def get_nodes_by_state(
@@ -1651,6 +1662,19 @@ def run_operator(
                 for node_name in rebooting_nodes:
                     if manager.monitor_node_recovery(node_name):
                         manager.complete_node_reboot(node_name)
+
+                # Phase 2.5: Clean up orphaned reservations for nodes that completed
+                # in a prior run (process crashed between completion and reservation deletion)
+                completed_nodes = manager.get_nodes_by_state(RebootState.COMPLETED, partition)
+                if completed_nodes:
+                    current_res_names = {res.name for res in manager.get_maintenance_reservations()}
+                    for node_name in completed_nodes:
+                        res_name = f"maint:{node_name}"
+                        if res_name in current_res_names:
+                            logger.info(
+                                f"Cleaning up orphaned reservation '{res_name}' for completed node"
+                            )
+                            reservation_manager.delete(res_name)
 
                 # Display reboot summary
                 summary = manager.get_reboot_summary(partition)

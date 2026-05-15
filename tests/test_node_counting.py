@@ -308,6 +308,82 @@ def test_all_down_states():
     print()
 
 
+def test_reservation_deleted_on_reboot_completion():
+    """Reservation should be deleted when node recovery completes."""
+    print("Testing reservation deletion on reboot completion...")
+
+    controller = Mock(spec=SlurmController)
+    reservation_manager = Mock(spec=ReservationManager)
+    reservation_manager.exists.return_value = True
+
+    partition_info = PartitionInfo(
+        name="compute",
+        nodes=[f"node{i:02d}" for i in range(1, 11)],
+        total_node_count=10,
+    )
+    controller.get_partition_info.return_value = [partition_info]
+
+    manager = MaintenanceManager(
+        controller=controller,
+        reservation_manager=reservation_manager,
+        max_down_percentage=20.0,
+        reboot_timeout=600,
+        reservation_lead_time=60,
+    )
+    manager.node_reboot_status["node01"] = NodeRebootStatus(
+        node_name="node01",
+        partition="compute",
+        state=RebootState.REBOOTING,
+    )
+
+    result = manager.complete_node_reboot("node01")
+
+    assert result is True
+    assert manager.node_reboot_status["node01"].state == RebootState.COMPLETED
+    reservation_manager.exists.assert_called_once_with("maint:node01")
+    reservation_manager.delete.assert_called_once_with("maint:node01")
+
+    print("  ✓ complete_node_reboot() deletes the maintenance reservation")
+    print("  ✓ Node state is COMPLETED after call")
+    print()
+
+
+def test_no_reservation_deletion_when_already_gone():
+    """complete_node_reboot() should not call delete if reservation no longer exists."""
+    print("Testing no-op deletion when reservation already gone...")
+
+    controller = Mock(spec=SlurmController)
+    reservation_manager = Mock(spec=ReservationManager)
+    reservation_manager.exists.return_value = False  # already gone
+
+    partition_info = PartitionInfo(
+        name="compute",
+        nodes=[f"node{i:02d}" for i in range(1, 11)],
+        total_node_count=10,
+    )
+    controller.get_partition_info.return_value = [partition_info]
+
+    manager = MaintenanceManager(
+        controller=controller,
+        reservation_manager=reservation_manager,
+        max_down_percentage=20.0,
+        reboot_timeout=600,
+        reservation_lead_time=60,
+    )
+    manager.node_reboot_status["node01"] = NodeRebootStatus(
+        node_name="node01",
+        partition="compute",
+        state=RebootState.REBOOTING,
+    )
+
+    manager.complete_node_reboot("node01")
+
+    reservation_manager.delete.assert_not_called()
+
+    print("  ✓ delete() not called when reservation is already gone")
+    print()
+
+
 def run_all_tests():
     """Run all integration tests."""
     print("=" * 70)
@@ -321,6 +397,8 @@ def run_all_tests():
         test_combined_counting_no_overlap()
         test_combined_counting_with_overlap()
         test_all_down_states()
+        test_reservation_deleted_on_reboot_completion()
+        test_no_reservation_deletion_when_already_gone()
         
         print("=" * 70)
         print("🎉 All integration tests passed!")
