@@ -33,6 +33,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import click
 import pendulum
+from ClusterShell.NodeSet import NodeSet
+from ClusterShell.Task import task_self
 from loguru import logger
 
 # ==================== Data Classes ====================
@@ -151,6 +153,7 @@ class NodeRebootStatus:
     reboot_complete_time: Optional[datetime] = None
     attempts: int = 0
     max_attempts: int = 3
+    is_revival: bool = False  # True when DECOMMISSION node is being revived
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -167,6 +170,7 @@ class NodeRebootStatus:
             else None,
             "attempts": self.attempts,
             "max_attempts": self.max_attempts,
+            "is_revival": self.is_revival,
         }
 
     @staticmethod
@@ -185,6 +189,7 @@ class NodeRebootStatus:
             else None,
             attempts=data["attempts"],
             max_attempts=data["max_attempts"],
+            is_revival=data.get("is_revival", False),  # Backward compatibility
         )
 
 
@@ -1087,8 +1092,7 @@ class MaintenanceManager:
         """Re-queue a decommissioned node for revival (AWAITING_REVIVAL → PENDING).
 
         The node re-enters the existing reboot pipeline: issue_reboot() brings
-        it back up and monitor_node_recovery() confirms recovery — no separate
-        stub required.
+        it back up and monitor_node_recovery() confirms recovery.
         """
         if node_name not in self.node_reboot_status:
             logger.error(
@@ -1105,6 +1109,8 @@ class MaintenanceManager:
             return False
 
         status.state = RebootState.PENDING
+        status.is_revival = True  # Mark this as a revival operation
+        status.attempts = 0  # Reset attempts for the revival
         logger.info(f"Node '{node_name}' queued for revival via reboot pipeline")
         return True
 
@@ -1122,8 +1128,35 @@ class MaintenanceManager:
             )
             return False
 
-        # STUB: This is where you would actually issue the reboot command
-        logger.info(f"[STUB] Issuing reboot command to node '{node_name}'")
+        # Issue the reboot command via ClusterShell
+        if self.controller.dry_run:
+            logger.info(
+                f"[DRY-RUN] Would reboot '{node_name}' with: 'sudo date && sudo reboot -f'"
+            )
+        else:
+            logger.info(f"Issuing reboot to '{node_name}' via ClusterShell")
+            try:
+                task = task_self()
+                task.shell(
+                    "sudo date && sudo reboot -f",
+                    nodes=NodeSet(node_name),
+                    handler=None,
+                    timeout=30,
+                )
+                task.run()
+
+                if task.num_timeout() > 0:
+                    logger.debug(f"Reboot command to '{node_name}' timed out (expected)")
+
+                if task.max_retcode() not in (None, 0):
+                    logger.debug(
+                        f"Reboot command to '{node_name}' exited {task.max_retcode()} "
+                        "(expected if SSH closed mid-reboot)"
+                    )
+
+            except Exception as e:
+                logger.error(f"Failed to issue reboot to '{node_name}': {e}")
+                return False
 
         status.state = RebootState.REBOOTING
         status.reboot_start_time = datetime.now()
@@ -1131,6 +1164,59 @@ class MaintenanceManager:
 
         logger.info(
             f"Node '{node_name}' reboot initiated (attempt {status.attempts}/{status.max_attempts})"
+        )
+        return True
+
+    def issue_shutdown(self, node_name: str) -> bool:
+        """Issue a shutdown command to a node (for decommission)."""
+        if node_name not in self.node_reboot_status:
+            logger.error(f"Node '{node_name}' not found in reboot status tracking")
+            return False
+
+        status = self.node_reboot_status[node_name]
+
+        if status.state != RebootState.PENDING:
+            logger.warning(
+                f"Node '{node_name}' is not in PENDING state (current: {status.state.value})"
+            )
+            return False
+
+        # Issue the shutdown command via ClusterShell
+        if self.controller.dry_run:
+            logger.info(
+                f"[DRY-RUN] Would shutdown '{node_name}' with: 'sudo shutdown -h now'"
+            )
+        else:
+            logger.info(f"Issuing shutdown to '{node_name}' via ClusterShell")
+            try:
+                task = task_self()
+                # The node will power off and remain offline until explicitly revived.
+                task.shell(
+                    "sudo shutdown -h now",
+                    nodes=NodeSet(node_name),
+                    handler=None,
+                    timeout=30,
+                )
+                task.run()
+
+                if task.num_timeout() > 0:
+                    logger.debug(f"Shutdown command to '{node_name}' timed out (expected)")
+                if task.max_retcode() not in (None, 0):
+                    logger.debug(
+                        f"Shutdown command to '{node_name}' exited {task.max_retcode()} "
+                        "(expected if SSH closed mid-shutdown)"
+                    )
+
+            except Exception as e:
+                logger.error(f"Failed to issue shutdown to '{node_name}': {e}")
+                return False
+
+        status.state = RebootState.REBOOTING
+        status.reboot_start_time = datetime.now()
+        status.attempts += 1
+
+        logger.info(
+            f"Node '{node_name}' shutdown initiated (attempt {status.attempts}/{status.max_attempts})"
         )
         return True
 
@@ -1144,8 +1230,8 @@ class MaintenanceManager:
         if status.state != RebootState.REBOOTING:
             return status.state == RebootState.COMPLETED
 
-        # STUB: This is where you would actually check if the node is up
-        logger.debug(f"[STUB] Checking if node '{node_name}' has recovered from reboot")
+        # Check if the node has recovered from reboot
+        logger.debug(f"Checking if node '{node_name}' has recovered from reboot")
 
         # Check for timeout
         if status.reboot_start_time:
@@ -1169,15 +1255,27 @@ class MaintenanceManager:
         return False
 
     def complete_node_reboot(self, node_name: str) -> bool:
-        """Mark a node reboot as completed."""
+        """Mark a node reboot/shutdown as completed."""
         if node_name not in self.node_reboot_status:
             return False
 
         status = self.node_reboot_status[node_name]
-        status.state = RebootState.COMPLETED
-        status.reboot_complete_time = datetime.now()
 
-        logger.success(f"Node '{node_name}' reboot completed successfully")
+        # For DECOMMISSION nodes that were shut down (not revival), move to AWAITING_REVIVAL
+        # For REBOOT nodes or DECOMMISSION revivals, move to COMPLETED
+        if status.maintenance_type == MaintananceType.DECOMMISSION and not status.is_revival:
+            status.state = RebootState.AWAITING_REVIVAL
+            logger.success(
+                f"Node '{node_name}' shutdown completed successfully - awaiting revival"
+            )
+        else:
+            status.state = RebootState.COMPLETED
+            status.reboot_complete_time = datetime.now()
+            # Reset is_revival flag after successful revival
+            if status.is_revival:
+                status.is_revival = False
+            logger.success(f"Node '{node_name}' reboot completed successfully")
+
         return True
 
     def get_nodes_by_state(
@@ -1636,12 +1734,16 @@ def run_operator(
                     if total_count > 0:
                         current_percentage = (combined_count / total_count) * 100
                         if current_percentage < max_down_percentage:
-                            status = manager.node_reboot_status[node_name]
-                            if manager.issue_reboot(node_name) and status.maintenance_type == MaintananceType.DECOMMISSION:
-                                status.state = RebootState.AWAITING_REVIVAL
+                            # Dispatch to the correct operation based on maintenance type and revival state
+                            if status.maintenance_type == MaintananceType.DECOMMISSION and not status.is_revival:
+                                # Initial decommission: shutdown the node
+                                manager.issue_shutdown(node_name)
+                            else:
+                                # Regular reboot OR decommission revival: reboot the node
+                                manager.issue_reboot(node_name)
                         else:
                             logger.debug(
-                                f"Deferring reboot of '{node_name}' due to rate limit"
+                                f"Deferring operation on '{node_name}' due to rate limit"
                             )
 
                 # Monitor rebooting nodes
