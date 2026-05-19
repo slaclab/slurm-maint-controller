@@ -38,6 +38,39 @@ from loguru import logger
 # ==================== Data Classes ====================
 
 
+def get_partition_from_node_name(node_name: str) -> Optional[str]:
+    """
+    Extract partition name from node name following sdf{PARTITION}{###} convention.
+
+    Args:
+        node_name: Node name (e.g., "sdfgpu001", "sdfmilano042")
+
+    Returns:
+        Partition name (e.g., "gpu", "milano"), or None if pattern doesn't match
+
+    Examples:
+        >>> get_partition_from_node_name("sdfgpu001")
+        "gpu"
+        >>> get_partition_from_node_name("sdfmilano042")
+        "milano"
+        >>> get_partition_from_node_name("node01")
+        None
+    """
+    if not node_name.startswith("sdf"):
+        return None
+
+    remainder = node_name[3:]  # Remove "sdf" prefix
+
+    # Find where digits start (partition ends)
+    for i, char in enumerate(remainder):
+        if char.isdigit():
+            partition = remainder[:i]
+            return partition if partition else None
+
+    # No digits found - entire remainder is partition name
+    return remainder if remainder else None
+
+
 class MaintananceType(Enum):
     REBOOT = "reboot"
     DECOMMISSION = "decommission"
@@ -366,6 +399,19 @@ class Reservation:
                 return parts[1]
 
         return self.nodes[0] if self.nodes else None
+
+    def get_partition(self) -> Optional[str]:
+        """
+        Get partition from maintenance reservation by extracting from node name.
+
+        Uses the node naming convention: sdf{PARTITION}{###}
+        For non-maintenance reservations or nodes that don't follow the pattern,
+        returns None.
+        """
+        node_name = self.get_node_name()
+        if node_name:
+            return get_partition_from_node_name(node_name)
+        return None
 
     def format_duration(self) -> str:
         """Format duration in Slurm format (days-hours:minutes:seconds)."""
@@ -954,9 +1000,17 @@ class MaintenanceManager:
         reservations = self.get_maintenance_reservations()
         for res in reservations:
             node_name = res.get_node_name()
-            if node_name and node_name in partition_nodes:
-                if res.is_active_or_starting_soon(self.reservation_lead_time):
-                    unavailable_nodes.add(node_name)
+            if not node_name:
+                continue
+
+            # Extract partition from node name and filter
+            res_partition = get_partition_from_node_name(node_name)
+            if res_partition != partition:
+                continue  # Skip reservations for other partitions
+
+            # Check if reservation is active or starting soon
+            if res.is_active_or_starting_soon(self.reservation_lead_time):
+                unavailable_nodes.add(node_name)
 
         # Count nodes being rebooted or pending reboot
         for node_name, status in self.node_reboot_status.items():
