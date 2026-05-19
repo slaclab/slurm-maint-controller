@@ -1221,7 +1221,7 @@ class MaintenanceManager:
         return True
 
     def monitor_node_recovery(self, node_name: str) -> bool:
-        """Check if a node has recovered from reboot."""
+        """Check if a node has recovered from reboot or completed shutdown."""
         if node_name not in self.node_reboot_status:
             return False
 
@@ -1230,15 +1230,52 @@ class MaintenanceManager:
         if status.state != RebootState.REBOOTING:
             return status.state == RebootState.COMPLETED
 
-        # Check if the node has recovered from reboot
-        logger.debug(f"Checking if node '{node_name}' has recovered from reboot")
+        # Get current node state from Slurm
+        try:
+            node_states = self.controller.get_node_states(status.partition)
+            if node_name not in node_states:
+                logger.warning(
+                    f"Node '{node_name}' not found in Slurm partition '{status.partition}'"
+                )
+                # Continue checking - node might be temporarily unavailable during reboot
+            else:
+                node_state = node_states[node_name]
+                is_down = node_state.is_down()
+
+                # Determine success based on operation type
+                if status.maintenance_type == MaintananceType.DECOMMISSION and not status.is_revival:
+                    # Initial decommission (shutdown): success = node is DOWN
+                    if is_down:
+                        logger.info(
+                            f"Node '{node_name}' shutdown completed - node is offline (state: {node_state.state})"
+                        )
+                        return True
+                    else:
+                        logger.debug(
+                            f"Waiting for node '{node_name}' to go offline (current state: {node_state.state})"
+                        )
+                else:
+                    # Reboot or revival: success = node is UP (not down)
+                    if not is_down:
+                        logger.info(
+                            f"Node '{node_name}' is back online (state: {node_state.state})"
+                        )
+                        return True
+                    else:
+                        logger.debug(
+                            f"Waiting for node '{node_name}' to come back online (current state: {node_state.state})"
+                        )
+
+        except Exception as e:
+            logger.warning(f"Failed to check node '{node_name}' state: {e}")
+            # Don't fail immediately - might be transient
 
         # Check for timeout
         if status.reboot_start_time:
             elapsed = (datetime.now() - status.reboot_start_time).total_seconds()
             if elapsed > self.reboot_timeout:
                 logger.warning(
-                    f"Node '{node_name}' reboot timed out after {elapsed:.0f}s"
+                    f"Node '{node_name}' operation timed out after {elapsed:.0f}s"
                 )
 
                 if status.attempts >= status.max_attempts:
