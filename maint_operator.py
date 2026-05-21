@@ -33,8 +33,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import click
 import pendulum
-from ClusterShell.NodeSet import NodeSet
-from ClusterShell.Task import task_self
 from loguru import logger
 
 # ==================== Data Classes ====================
@@ -902,6 +900,65 @@ class SlurmController:
             logger.error(f"Failed to terminate job {job.job_id}: {e.stderr}")
             return False
 
+    def reboot_node(self, node_name: str, asap: bool = True) -> bool:
+        """
+        Reboot a node using scontrol reboot command.
+
+        Args:
+            node_name: Name of the node to reboot
+            asap: If True, uses ASAP mode (drains node and reboots when jobs complete)
+
+        Returns:
+            True if command succeeded, False otherwise
+        """
+        cmd = ["scontrol", "reboot"]
+        if asap:
+            cmd.append("ASAP")
+        cmd.append(node_name)
+
+        logger.info(f"Issuing reboot to '{node_name}' via scontrol")
+        logger.debug(f"Command: {' '.join(cmd)}")
+
+        if self.dry_run:
+            logger.warning(f"[DRY-RUN] Would execute: {' '.join(cmd)}")
+            return True
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.success(f"Reboot command issued for '{node_name}'")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to issue reboot for '{node_name}': {e.stderr}")
+            return False
+
+    def shutdown_node(self, node_name: str, reason: str = "decommission") -> bool:
+        """
+        Mark a node as DOWN in Slurm (for decommission).
+
+        Args:
+            node_name: Name of the node to mark as DOWN
+            reason: Reason for marking the node down
+
+        Returns:
+            True if command succeeded, False otherwise
+        """
+        cmd = ["scontrol", "update", f"NodeName={node_name}", "State=DOWN", f"Reason={reason}"]
+
+        logger.info(f"Marking '{node_name}' as DOWN in Slurm for {reason}")
+        logger.debug(f"Command: {' '.join(cmd)}")
+
+        if self.dry_run:
+            logger.warning(f"[DRY-RUN] Would execute: {' '.join(cmd)}")
+            return True
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.success(f"Node '{node_name}' marked as DOWN")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to mark '{node_name}' as DOWN: {e.stderr}")
+            return False
+
 
 # ==================== Maintenance Manager ====================
 
@@ -1128,35 +1185,9 @@ class MaintenanceManager:
             )
             return False
 
-        # Issue the reboot command via ClusterShell
-        if self.controller.dry_run:
-            logger.info(
-                f"[DRY-RUN] Would reboot '{node_name}' with: 'sudo date && sudo reboot -f'"
-            )
-        else:
-            logger.info(f"Issuing reboot to '{node_name}' via ClusterShell")
-            try:
-                task = task_self()
-                task.shell(
-                    "sudo date && sudo reboot -f",
-                    nodes=NodeSet(node_name),
-                    handler=None,
-                    timeout=30,
-                )
-                task.run()
-
-                if task.num_timeout() > 0:
-                    logger.debug(f"Reboot command to '{node_name}' timed out (expected)")
-
-                if task.max_retcode() not in (None, 0):
-                    logger.debug(
-                        f"Reboot command to '{node_name}' exited {task.max_retcode()} "
-                        "(expected if SSH closed mid-reboot)"
-                    )
-
-            except Exception as e:
-                logger.error(f"Failed to issue reboot to '{node_name}': {e}")
-                return False
+        # Issue the reboot command via scontrol
+        if not self.controller.reboot_node(node_name, asap=True):
+            return False
 
         status.state = RebootState.REBOOTING
         status.reboot_start_time = datetime.now()
@@ -1168,7 +1199,7 @@ class MaintenanceManager:
         return True
 
     def issue_shutdown(self, node_name: str) -> bool:
-        """Issue a shutdown command to a node (for decommission)."""
+        """Mark a node as DOWN in Slurm (for decommission)."""
         if node_name not in self.node_reboot_status:
             logger.error(f"Node '{node_name}' not found in reboot status tracking")
             return False
@@ -1181,42 +1212,16 @@ class MaintenanceManager:
             )
             return False
 
-        # Issue the shutdown command via ClusterShell
-        if self.controller.dry_run:
-            logger.info(
-                f"[DRY-RUN] Would shutdown '{node_name}' with: 'sudo shutdown -h now'"
-            )
-        else:
-            logger.info(f"Issuing shutdown to '{node_name}' via ClusterShell")
-            try:
-                task = task_self()
-                # The node will power off and remain offline until explicitly revived.
-                task.shell(
-                    "sudo shutdown -h now",
-                    nodes=NodeSet(node_name),
-                    handler=None,
-                    timeout=30,
-                )
-                task.run()
+        # Mark node as DOWN in Slurm via controller
+        if not self.controller.shutdown_node(node_name, reason="decommission"):
+            return False
 
-                if task.num_timeout() > 0:
-                    logger.debug(f"Shutdown command to '{node_name}' timed out (expected)")
-                if task.max_retcode() not in (None, 0):
-                    logger.debug(
-                        f"Shutdown command to '{node_name}' exited {task.max_retcode()} "
-                        "(expected if SSH closed mid-shutdown)"
-                    )
-
-            except Exception as e:
-                logger.error(f"Failed to issue shutdown to '{node_name}': {e}")
-                return False
-
-        status.state = RebootState.REBOOTING
+        status.state = RebootState.REBOOTING  # Transition to monitoring state
         status.reboot_start_time = datetime.now()
         status.attempts += 1
 
         logger.info(
-            f"Node '{node_name}' shutdown initiated (attempt {status.attempts}/{status.max_attempts})"
+            f"Node '{node_name}' decommission initiated (attempt {status.attempts}/{status.max_attempts})"
         )
         return True
 
