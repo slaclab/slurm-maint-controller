@@ -861,6 +861,30 @@ class SlurmController:
             logger.debug(f"No jobs found on node {node_name}: {e.stderr}")
             return JobList([])
 
+    def get_node_states_by_names(self, node_names: List[str]) -> Dict[str, NodeState]:
+        """Get the state of specific nodes by name, regardless of partition."""
+        node_states = {}
+        for node in node_names:
+            found = False
+            try:
+                cmd = ["sinfo", "-h", "-n", node, "-o", "%n|%T"]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                for line in result.stdout.strip().split("\n"):
+                    if not line.strip():
+                        continue
+                    parts = line.split("|")
+                    if len(parts) != 2:
+                        continue
+                    node_name = parts[0]
+                    state = parts[1]
+                    node_states[node_name] = NodeState(name=node_name, state=state)
+                    found = True
+                if not found:
+                    logger.warning(f"Node '{node}' not found in Slurm output for sinfo -n {node}.")
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"Failed to get state for node '{node}': {e.stderr}")
+        return node_states
+
     def _parse_time_limit(self, time_str: str) -> pendulum.Duration:
         """Parse Slurm time limit format."""
         if time_str == "UNLIMITED" or time_str == "NOT_SET":
@@ -976,6 +1000,7 @@ class MaintenanceManager:
         reboot_timeout: int = 600,
         reservation_lead_time: int = 60,
         state_file: Optional[str] = None,
+        target_nodes: Optional[List[str]] = None,
     ):
         self.controller = controller
         self.reservation_manager = reservation_manager
@@ -984,6 +1009,7 @@ class MaintenanceManager:
         self.reservation_lead_time = reservation_lead_time  # minutes
         self.state_file = state_file
         self.node_reboot_status: Dict[str, NodeRebootStatus] = {}
+        self.target_nodes = set(target_nodes) if target_nodes else None
 
         if self.state_file:
             self.load_state()
@@ -1042,7 +1068,25 @@ class MaintenanceManager:
         Returns:
             Tuple of (down_count, total_count, down_node_set)
         """
-        # Get partition info
+        # If target_nodes is set (from --nodelist), use that for node state queries
+        if self.target_nodes is not None:
+            target_nodes = list(self.target_nodes)
+            total_nodes = len(target_nodes)
+            if total_nodes == 0:
+                return (0, 0, set())
+            logger.debug("Refreshing node states from Slurm for explicit nodelist")
+            node_states = self.controller.get_node_states_by_names(target_nodes)
+            down_nodes = set()
+            for node_name in target_nodes:
+                if node_name in node_states and node_states[node_name].is_down():
+                    down_nodes.add(node_name)
+            down_count = len(down_nodes)
+            logger.debug(
+                f"Found {down_count} down nodes in nodelist: {','.join(sorted(down_nodes)) if down_nodes else '(none)'}"
+            )
+            return (down_count, total_nodes, down_nodes)
+
+        # Otherwise, use partition-based logic
         partition_info_list = self.controller.get_partition_info(partition)
         if not partition_info_list:
             logger.error(f"Could not get info for partition '{partition}'")
@@ -1055,7 +1099,6 @@ class MaintenanceManager:
         if total_nodes == 0:
             return (0, 0, set())
 
-        # Get node states from Slurm (refreshed on every call)
         logger.debug(f"Refreshing node states from Slurm for partition '{partition}'")
         node_states = self.controller.get_node_states(partition)
 
@@ -1325,66 +1368,22 @@ class MaintenanceManager:
     def get_nodes_by_state(
         self, state: RebootState, partition: Optional[str] = None
     ) -> List[str]:
-        """Get list of nodes in a specific reboot state."""
+        """Get list of nodes in a specific reboot state, filtered by target_nodes if set."""
         nodes = []
         for node_name, status in self.node_reboot_status.items():
             if status.state == state:
                 if partition is None or status.partition == partition:
-                    nodes.append(node_name)
+                    if self.target_nodes is None or node_name in self.target_nodes:
+                        nodes.append(node_name)
         return nodes
 
     def get_reboot_summary(self, partition: Optional[str] = None) -> Dict[str, int]:
         """Get summary of reboot states."""
         summary = {state.value: 0 for state in RebootState}
-
         for status in self.node_reboot_status.values():
             if partition is None or status.partition == partition:
                 summary[status.state.value] += 1
-
         return summary
-
-    def save_state(self) -> None:
-        """Save reboot state to file."""
-        if not self.state_file:
-            logger.debug("No state file configured, skipping save")
-            return
-
-        try:
-            state_data = {
-                "node_reboot_status": {
-                    node_name: status.to_dict()
-                    for node_name, status in self.node_reboot_status.items()
-                }
-            }
-
-            with open(self.state_file, "w") as f:
-                json.dump(state_data, f, indent=2)
-
-            logger.debug(f"Saved state to {self.state_file}")
-        except Exception as e:
-            logger.error(f"Failed to save state: {e}")
-
-    def load_state(self) -> None:
-        """Load reboot state from file."""
-        if not self.state_file or not os.path.exists(self.state_file):
-            return
-
-        try:
-            with open(self.state_file, "r") as f:
-                state_data = json.load(f)
-
-            self.node_reboot_status = {
-                node_name: NodeRebootStatus.from_dict(status_dict)
-                for node_name, status_dict in state_data.get(
-                    "node_reboot_status", {}
-                ).items()
-            }
-
-            logger.info(
-                f"Loaded state from {self.state_file} ({len(self.node_reboot_status)} nodes)"
-            )
-        except Exception as e:
-            logger.error(f"Failed to load state: {e}")
 
     def clear_completed_nodes(self, max_age_hours: int = 24) -> None:
         """Remove old completed/failed nodes from tracking."""
@@ -1431,8 +1430,16 @@ def run_operator(
     """
     Main operator loop that creates reservations and manages reboots.
     """
+
     controller = SlurmController(dry_run=dry_run)
     reservation_manager = ReservationManager(dry_run=dry_run)
+
+    # Get target nodes
+    if nodelist:
+        target_nodes = list(expand_slurm_nodelist(nodelist))
+    else:
+        target_nodes = controller.get_all_nodes()
+
     manager = MaintenanceManager(
         controller=controller,
         reservation_manager=reservation_manager,
@@ -1440,6 +1447,7 @@ def run_operator(
         reboot_timeout=reboot_timeout,
         reservation_lead_time=reservation_lead_time,
         state_file=state_file,
+        target_nodes=target_nodes,
     )
 
     logger.info(f"Starting Slurm Maintenance Operator (interval: {interval}s)")
@@ -1456,12 +1464,6 @@ def run_operator(
     logger.info(f"  Decommission enabled: {enable_decommission}")
     logger.info(f"  Terminate preemptable: {terminate_preemptable_jobs}")
     logger.info(f"  Dry run: {dry_run}")
-
-    # Get target nodes
-    if nodelist:
-        target_nodes = list(expand_slurm_nodelist(nodelist))
-    else:
-        target_nodes = controller.get_all_nodes()
 
     logger.info(f"Managing {len(target_nodes)} nodes")
 
