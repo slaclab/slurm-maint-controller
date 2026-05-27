@@ -682,7 +682,7 @@ tail -f /var/log/maint-operator.log
 watch -n 5 'cat /var/tmp/slurm-maint-compute.json | jq ".nodes | group_by(.state) | map({state: .[0].state, count: length})"'
 
 # Check Slurm reservations
-watch -n 10 'scontrol show reservation | grep maint:'
+watch -n 10 'scontrol show reservation | grep maint-$USER:'
 
 # Monitor partition status
 watch -n 10 'sinfo -p compute'

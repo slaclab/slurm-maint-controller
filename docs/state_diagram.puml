@@ -33,7 +33,7 @@ entry_branch --> PENDING              : [--decommission]\nmark_node_for_decommis
 
 state RESERVATION_PENDING<<inprogress>> : Calculating reservation start time\nbased on running jobs:\n- no jobs → start now\n- preemptable jobs → after longest\n- regular jobs → after longest
 
-RESERVATION_PENDING --> DRAINING      : Reservation created\n(scontrol create reservation\nmaint:{node_name})
+RESERVATION_PENDING --> DRAINING      : Reservation created\n(scontrol create reservation\nmaint-$USER:{node_name})
 
 state DRAINING<<inprogress>> : Reservation active; Slurm blocks\nnew jobs. Existing jobs run to\ncompletion. Node unavailable\nto the scheduler.
 

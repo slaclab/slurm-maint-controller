@@ -35,6 +35,8 @@ import click
 import pendulum
 from loguru import logger
 
+USER = os.getenv("USER", "UNKONWN")
+
 # ==================== Data Classes ====================
 
 
@@ -360,7 +362,7 @@ class Reservation:
         """
         Get the node name from a maintenance reservation.
 
-        For maintenance reservations with format 'maint:nodename',
+        For maintenance reservations with format 'maint-$USER:nodename',
         returns the node name. Otherwise returns the first node.
         """
         if self.is_maintenance_reservation():
@@ -473,7 +475,7 @@ class ReservationManager:
 
     def get_maintenance(self) -> List[Reservation]:
         """
-        Get all maintenance reservations (name starts with 'maint:').
+        Get all maintenance reservations (name starts with 'maint-$USER:').
 
         Returns:
             List of Reservation objects for maintenance reservations
@@ -1630,7 +1632,7 @@ def run_operator(
                         # Create updated reservation object
                         duration = parse_duration_string(reservation_duration)
                         updated_reservation = Reservation(
-                            name=f"maint:{node_name}",
+                            name="maint-" + USER + f":{node_name}",
                             nodes=[node_name],
                             start_time=new_reservation_start_time,
                             duration=duration,
@@ -1720,7 +1722,7 @@ def run_operator(
                     # Create reservation object and create it in Slurm
                     duration = parse_duration_string(reservation_duration)
                     reservation = Reservation(
-                        name=f"maint:{node_name}",
+                        name="maint-" + USER + f":{node_name}",
                         nodes=[node_name],
                         start_time=reservation_start_time,
                         duration=duration,
