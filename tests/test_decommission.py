@@ -20,6 +20,7 @@ from maint_operator import (
 
 def make_manager(total=10, max_pct=20.0):
     controller = Mock(spec=SlurmController)
+    controller.dry_run = False  # Add dry_run attribute
     reservation_manager = Mock(spec=ReservationManager)
     partition_info = PartitionInfo(
         name="compute",
@@ -58,8 +59,8 @@ def test_full_decommission_lifecycle():
     # Second call is idempotent
     assert manager.mark_node_for_decommission("node01", "compute") is False
 
-    # Drain completes: reboot command issued, then state parked at AWAITING_REVIVAL
-    manager.issue_reboot("node01")
+    # Drain completes: shutdown command issued, then state parked at AWAITING_REVIVAL
+    manager.issue_shutdown("node01")
     manager.node_reboot_status["node01"].state = RebootState.AWAITING_REVIVAL
     assert manager.node_reboot_status["node01"].state == RebootState.AWAITING_REVIVAL
     _, _, unavailable = manager.count_unavailable_nodes("compute")
@@ -79,7 +80,7 @@ def test_full_decommission_lifecycle():
     # Reboot pipeline picks it up (issue_reboot) and recovery monitoring completes it
     manager.issue_reboot("node01")
     assert manager.node_reboot_status["node01"].state == RebootState.REBOOTING
-    assert manager.node_reboot_status["node01"].attempts == 2  # shutdown + revival
+    assert manager.node_reboot_status["node01"].attempts == 1  # Revival reboot (attempts reset on revival)
 
     # Recovery monitoring marks the node done
     manager.complete_node_reboot("node01")
