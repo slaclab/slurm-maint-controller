@@ -317,7 +317,7 @@ class Reservation:
 
     def is_maintenance_reservation(self) -> bool:
         """Check if this is a maintenance reservation."""
-        return self.name.startswith("maint-op:")
+        return self.name.startswith(f"maint-{USER}:")
 
     def is_active(self) -> bool:
         """Check if reservation is currently active."""
