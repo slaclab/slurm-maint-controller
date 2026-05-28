@@ -649,9 +649,13 @@ class ReservationManager:
         Returns:
             True if successful, False otherwise
         """
-        cmd = ["scontrol", "delete", "reservation", reservation.name]
+        return self.delete_by_name(reservation.name)
 
-        logger.info(f"Deleting reservation: {reservation.name}")
+    def delete_by_name(self, name: str) -> bool:
+        """Delete a reservation from Slurm by name."""
+        cmd = ["scontrol", "delete", "reservation", name]
+
+        logger.info(f"Deleting reservation: {name}")
         logger.debug(f"Command: {' '.join(cmd)}")
 
         if self.dry_run:
@@ -1973,6 +1977,7 @@ def run_operator(
                 for node_name in rebooting_nodes:
                     if manager.monitor_node_recovery(node_name):
                         manager.complete_node_reboot(node_name)
+                        reservation_manager.delete_by_name(f"maint-{USER}:{node_name}")
 
                 # Display reboot summary
                 summary = manager.get_reboot_summary(partition)
