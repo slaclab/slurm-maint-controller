@@ -1039,9 +1039,16 @@ class SlurmController:
         cmd = ["clush", "-w", node_name, "sudo", "monit", "summary", "-B"]
         logger.debug(f"Checking monit health on '{node_name}': {' '.join(cmd)}")
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            logger.debug(f"Node '{node_name}' monit check timed out — node likely still unreachable")
+            return False
         except subprocess.CalledProcessError as e:
-            logger.warning(f"monit summary failed on '{node_name}': {e.stderr.strip()}")
+            # Exit 255 = SSH connection failed (node is down/unreachable)
+            if e.returncode == 255:
+                logger.debug(f"Node '{node_name}' is unreachable via SSH — still coming up")
+            else:
+                logger.warning(f"monit summary failed on '{node_name}' (exit {e.returncode}): {e.stderr.strip()}")
             return False
         except FileNotFoundError:
             logger.warning("clush not found; skipping monit health check")
@@ -1335,6 +1342,7 @@ class MaintenanceManager:
         status.state = RebootState.REBOOTING
         status.reboot_start_time = datetime.now()
         status.attempts += 1
+        status.seen_down = False
 
         logger.info(
             f"Node '{node_name}' reboot initiated (attempt {status.attempts}/{status.max_attempts})"
@@ -1362,6 +1370,7 @@ class MaintenanceManager:
         status.state = RebootState.REBOOTING  # Transition to monitoring state
         status.reboot_start_time = datetime.now()
         status.attempts += 1
+        status.seen_down = False
 
         logger.info(
             f"Node '{node_name}' decommission initiated (attempt {status.attempts}/{status.max_attempts})"
