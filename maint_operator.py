@@ -1034,6 +1034,23 @@ class SlurmController:
             logger.error(f"Failed to mark '{node_name}' as DOWN: {e.stderr}")
             return False
 
+    def get_node_boot_time(self, node_name: str) -> Optional[datetime]:
+        """Return the BootTime of a node from scontrol, or None if unavailable."""
+        try:
+            result = subprocess.run(
+                ["scontrol", "show", "node", "-o", node_name],
+                capture_output=True, text=True, check=True,
+            )
+            match = re.search(r"BootTime=(\S+)", result.stdout)
+            if not match:
+                return None
+            raw = match.group(1)
+            if raw in ("None", "Unknown", "N/A"):
+                return None
+            return datetime.fromisoformat(raw)
+        except (subprocess.CalledProcessError, ValueError):
+            return None
+
     def check_monit_healthy(self, node_name: str) -> bool:
         """Run 'monit summary -B' on node via clush and verify all services are OK or Not monitored."""
         cmd = ["clush", "-w", node_name, "sudo", "monit", "summary", "-B"]
@@ -1407,20 +1424,20 @@ class MaintenanceManager:
             except Exception as e:
                 logger.warning(f"Failed to check node '{node_name}' state: {e}")
 
-        # Reboot or revival: monit is the source of truth
+        # Reboot or revival: boot time + monit are the source of truth
         else:
-            monit_ok = self.controller.check_monit_healthy(node_name)
-            if not monit_ok:
-                if not status.seen_down:
-                    status.seen_down = True
-                    logger.debug(f"Node '{node_name}' is unreachable — reboot in progress")
-                else:
-                    logger.debug(f"Node '{node_name}' still unreachable, waiting for recovery")
-            elif status.seen_down:
-                logger.info(f"Node '{node_name}' is back online and healthy")
-                return True
+            boot_time = self.controller.get_node_boot_time(node_name)
+            if boot_time is None or status.reboot_start_time is None or boot_time <= status.reboot_start_time:
+                logger.debug(
+                    f"Node '{node_name}' has not rebooted yet (boot time: {boot_time})"
+                )
+            elif not self.controller.check_monit_healthy(node_name):
+                logger.debug(
+                    f"Node '{node_name}' rebooted at {boot_time} but monit not yet healthy"
+                )
             else:
-                logger.debug(f"Node '{node_name}' monit OK but reboot not yet confirmed — waiting for node to go down first")
+                logger.info(f"Node '{node_name}' is back online and healthy (booted at {boot_time})")
+                return True
 
         # Check for timeout
         if status.reboot_start_time:
