@@ -187,6 +187,7 @@ class NodeRebootStatus:
     attempts: int = 0
     max_attempts: int = 3
     is_revival: bool = False  # True when DECOMMISSION node is being revived
+    seen_down: bool = False  # True once node has been observed DOWN after reboot issued
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -204,6 +205,7 @@ class NodeRebootStatus:
             "attempts": self.attempts,
             "max_attempts": self.max_attempts,
             "is_revival": self.is_revival,
+            "seen_down": self.seen_down,
         }
 
     @staticmethod
@@ -222,7 +224,8 @@ class NodeRebootStatus:
             else None,
             attempts=data["attempts"],
             max_attempts=data["max_attempts"],
-            is_revival=data.get("is_revival", False),  # Backward compatibility
+            is_revival=data.get("is_revival", False),
+            seen_down=data.get("seen_down", False),
         )
 
 
@@ -1400,8 +1403,15 @@ class MaintenanceManager:
                             f"Waiting for node '{node_name}' to go offline (current state: {node_state.state})"
                         )
                 else:
-                    # Reboot or revival: success = node is UP (not down) and monit is healthy
-                    if not is_down:
+                    # Reboot or revival: must see node go DOWN before it can be considered recovered
+                    if is_down:
+                        if not status.seen_down:
+                            status.seen_down = True
+                            logger.debug(
+                                f"Node '{node_name}' is down — reboot confirmed, waiting for recovery (state: {node_state.state})"
+                            )
+                    elif status.seen_down:
+                        # Node was down and is now back up — check monit
                         if self.controller.check_monit_healthy(node_name):
                             logger.info(
                                 f"Node '{node_name}' is back online and healthy (state: {node_state.state})"
@@ -1413,7 +1423,7 @@ class MaintenanceManager:
                             )
                     else:
                         logger.debug(
-                            f"Waiting for node '{node_name}' to come back online (current state: {node_state.state})"
+                            f"Waiting for node '{node_name}' to go down for reboot (current state: {node_state.state})"
                         )
 
         except Exception as e:
