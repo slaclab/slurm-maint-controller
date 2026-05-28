@@ -1395,6 +1395,49 @@ class MaintenanceManager:
 
         return False
 
+    def save_state(self) -> None:
+        """Save reboot state to file."""
+        if not self.state_file:
+            logger.debug("No state file configured, skipping save")
+            return
+
+        try:
+            state_data = {
+                "node_reboot_status": {
+                    node_name: status.to_dict()
+                    for node_name, status in self.node_reboot_status.items()
+                }
+            }
+
+            with open(self.state_file, "w") as f:
+                json.dump(state_data, f, indent=2)
+
+            logger.debug(f"Saved state to {self.state_file}")
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+
+    def load_state(self) -> None:
+        """Load reboot state from file."""
+        if not self.state_file or not os.path.exists(self.state_file):
+            return
+
+        try:
+            with open(self.state_file, "r") as f:
+                state_data = json.load(f)
+
+            self.node_reboot_status = {
+                node_name: NodeRebootStatus.from_dict(status_dict)
+                for node_name, status_dict in state_data.get(
+                    "node_reboot_status", {}
+                ).items()
+            }
+
+            logger.info(
+                f"Loaded state from {self.state_file} ({len(self.node_reboot_status)} nodes)"
+            )
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+
     def complete_node_reboot(self, node_name: str) -> bool:
         """Mark a node reboot/shutdown as completed."""
         if node_name not in self.node_reboot_status:
