@@ -1387,22 +1387,15 @@ class MaintenanceManager:
         if status.state != RebootState.REBOOTING:
             return status.state == RebootState.COMPLETED
 
-        # Get current node state from Slurm (use per-node query; partition query omits down nodes)
-        try:
-            node_states = self.controller.get_node_states_by_names([node_name])
-            if node_name not in node_states:
-                logger.warning(
-                    f"Node '{node_name}' not found in Slurm"
-                )
-                # Continue checking - node might be temporarily unavailable during reboot
-            else:
-                node_state = node_states[node_name]
-                is_down = node_state.is_down()
-
-                # Determine success based on operation type
-                if status.maintenance_type == MaintananceType.DECOMMISSION and not status.is_revival:
-                    # Initial decommission (shutdown): success = node is DOWN
-                    if is_down:
+        # Decommission (shutdown): use Slurm state as source of truth
+        if status.maintenance_type == MaintananceType.DECOMMISSION and not status.is_revival:
+            try:
+                node_states = self.controller.get_node_states_by_names([node_name])
+                if node_name not in node_states:
+                    logger.warning(f"Node '{node_name}' not found in Slurm")
+                else:
+                    node_state = node_states[node_name]
+                    if node_state.is_down():
                         logger.info(
                             f"Node '{node_name}' shutdown completed - node is offline (state: {node_state.state})"
                         )
@@ -1411,33 +1404,23 @@ class MaintenanceManager:
                         logger.debug(
                             f"Waiting for node '{node_name}' to go offline (current state: {node_state.state})"
                         )
-                else:
-                    # Reboot or revival: must see node go DOWN before it can be considered recovered
-                    if is_down:
-                        if not status.seen_down:
-                            status.seen_down = True
-                            logger.debug(
-                                f"Node '{node_name}' is down — reboot confirmed, waiting for recovery (state: {node_state.state})"
-                            )
-                    elif status.seen_down:
-                        # Node was down and is now back up — check monit
-                        if self.controller.check_monit_healthy(node_name):
-                            logger.info(
-                                f"Node '{node_name}' is back online and healthy (state: {node_state.state})"
-                            )
-                            return True
-                        else:
-                            logger.debug(
-                                f"Node '{node_name}' is up in Slurm but monit reports unhealthy services; waiting"
-                            )
-                    else:
-                        logger.debug(
-                            f"Waiting for node '{node_name}' to go down for reboot (current state: {node_state.state})"
-                        )
+            except Exception as e:
+                logger.warning(f"Failed to check node '{node_name}' state: {e}")
 
-        except Exception as e:
-            logger.warning(f"Failed to check node '{node_name}' state: {e}")
-            # Don't fail immediately - might be transient
+        # Reboot or revival: monit is the source of truth
+        else:
+            monit_ok = self.controller.check_monit_healthy(node_name)
+            if not monit_ok:
+                if not status.seen_down:
+                    status.seen_down = True
+                    logger.debug(f"Node '{node_name}' is unreachable — reboot in progress")
+                else:
+                    logger.debug(f"Node '{node_name}' still unreachable, waiting for recovery")
+            elif status.seen_down:
+                logger.info(f"Node '{node_name}' is back online and healthy")
+                return True
+            else:
+                logger.debug(f"Node '{node_name}' monit OK but reboot not yet confirmed — waiting for node to go down first")
 
         # Check for timeout
         if status.reboot_start_time:
