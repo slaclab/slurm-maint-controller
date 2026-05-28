@@ -1378,12 +1378,12 @@ class MaintenanceManager:
         if status.state != RebootState.REBOOTING:
             return status.state == RebootState.COMPLETED
 
-        # Get current node state from Slurm
+        # Get current node state from Slurm (use per-node query; partition query omits down nodes)
         try:
-            node_states = self.controller.get_node_states(status.partition)
+            node_states = self.controller.get_node_states_by_names([node_name])
             if node_name not in node_states:
                 logger.warning(
-                    f"Node '{node_name}' not found in Slurm partition '{status.partition}'"
+                    f"Node '{node_name}' not found in Slurm"
                 )
                 # Continue checking - node might be temporarily unavailable during reboot
             else:
