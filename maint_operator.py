@@ -1198,8 +1198,14 @@ class MaintenanceManager:
                 return (0, 0, set())
             logger.debug("Refreshing node states from Slurm for explicit nodelist")
             node_states = self.controller.get_node_states_by_names(target_nodes)
+            completed_nodes = {
+                n for n, s in self.node_reboot_status.items()
+                if s.state == RebootState.COMPLETED
+            }
             down_nodes = set()
             for node_name in target_nodes:
+                if node_name in completed_nodes:
+                    continue
                 if node_name in node_states and node_states[node_name].is_down():
                     down_nodes.add(node_name)
             down_count = len(down_nodes)
@@ -1225,7 +1231,13 @@ class MaintenanceManager:
         node_states = self.controller.get_node_states(partition)
 
         down_nodes = set()
+        completed_nodes = {
+            n for n, s in self.node_reboot_status.items()
+            if s.state == RebootState.COMPLETED
+        }
         for node_name in partition_nodes:
+            if node_name in completed_nodes:
+                continue
             if node_name in node_states and node_states[node_name].is_down():
                 down_nodes.add(node_name)
 
