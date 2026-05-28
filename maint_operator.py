@@ -1861,10 +1861,12 @@ def run_operator(
 
             # Phase 1: Create new reservations for nodes that don't have them
             if enable_reservations:
+                completed_nodes = manager.get_nodes_by_state(RebootState.COMPLETED)
                 nodes_needing_reservations = [
                     node
                     for node in target_nodes
                     if node not in existing_reservation_nodes
+                    and node not in completed_nodes
                 ]
 
                 logger.info(
