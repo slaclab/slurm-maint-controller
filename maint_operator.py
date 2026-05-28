@@ -1038,6 +1038,37 @@ class SlurmController:
             logger.error(f"Failed to mark '{node_name}' as DOWN: {e.stderr}")
             return False
 
+    def clear_node_down(self, node_name: str) -> bool:
+        """Clear the DOWN+DRAIN state left by a reboot cycle, warning if Slurm flagged a timeout."""
+        try:
+            result = subprocess.run(
+                ["scontrol", "show", "node", "-o", node_name],
+                capture_output=True, text=True, check=True,
+            )
+            match = re.search(r"Reason=([^\s].*?)(?:\s+\[|$)", result.stdout)
+            if match:
+                reason = match.group(1).strip()
+                if "timed out" in reason.lower():
+                    logger.warning(
+                        f"Node '{node_name}' had Slurm reboot timeout reason before clearing: "
+                        f"'{reason}' — consider increasing --reboot-timeout if this recurs"
+                    )
+        except subprocess.CalledProcessError:
+            pass
+
+        cmd = ["scontrol", "update", f"NodeName={node_name}", "State=resume"]
+        logger.debug(f"Clearing down state for '{node_name}': {' '.join(cmd)}")
+        if self.dry_run:
+            logger.warning(f"[DRY-RUN] Would execute: {' '.join(cmd)}")
+            return True
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.debug(f"Node '{node_name}' down state cleared")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to clear down state for '{node_name}': {e.stderr.strip()}")
+            return False
+
     def get_node_boot_time(self, node_name: str) -> Optional[datetime]:
         """Return the BootTime of a node from scontrol, or None if unavailable."""
         try:
@@ -1539,6 +1570,7 @@ class MaintenanceManager:
             # Reset is_revival flag after successful revival
             if status.is_revival:
                 status.is_revival = False
+            self.controller.clear_node_down(node_name)
             logger.success(f"Node '{node_name}' reboot completed successfully")
 
         return True
