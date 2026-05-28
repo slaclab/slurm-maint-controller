@@ -1086,6 +1086,21 @@ class SlurmController:
         except (subprocess.CalledProcessError, ValueError):
             return None
 
+    def run_autoresume(self, node_name: str) -> None:
+        """Run autoresume-slurm.sh on the node to restore it to Slurm service."""
+        cmd = ["clush", "-w", node_name, "/usr/local/lib/monit/bin/autoresume-slurm.sh", "--now"]
+        logger.debug(f"Running autoresume on '{node_name}': {' '.join(cmd)}")
+        if self.dry_run:
+            logger.warning(f"[DRY-RUN] Would execute: {' '.join(cmd)}")
+            return
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+            logger.debug(f"Node '{node_name}' autoresume completed")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"autoresume-slurm.sh timed out on '{node_name}'")
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"autoresume-slurm.sh failed on '{node_name}': {e.stderr.strip()}")
+
     def check_monit_healthy(self, node_name: str) -> bool:
         """Run 'monit summary -B' on node via clush and verify all services are OK or Not monitored."""
         cmd = ["clush", "-w", node_name, "sudo", "monit", "summary", "-B"]
@@ -1483,6 +1498,7 @@ class MaintenanceManager:
                     f"Node '{node_name}' rebooted at {boot_time} but monit not yet healthy"
                 )
             else:
+                self.controller.run_autoresume(node_name)
                 logger.info(f"Node '{node_name}' is back online and healthy (booted at {boot_time})")
                 return True
 
