@@ -1031,6 +1031,47 @@ class SlurmController:
             logger.error(f"Failed to mark '{node_name}' as DOWN: {e.stderr}")
             return False
 
+    def check_monit_healthy(self, node_name: str) -> bool:
+        """Run 'monit summary -B' on node via clush and verify all services are OK or Not monitored."""
+        cmd = ["clush", "-w", node_name, "sudo", "monit", "summary", "-B"]
+        logger.debug(f"Checking monit health on '{node_name}': {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"monit summary failed on '{node_name}': {e.stderr.strip()}")
+            return False
+        except FileNotFoundError:
+            logger.warning("clush not found; skipping monit health check")
+            return True
+
+        unhealthy = []
+        for line in result.stdout.splitlines():
+            # Strip clush node prefix (e.g. "nodename: ")
+            if ": " in line:
+                line = line.split(": ", 1)[1]
+            # Skip header/blank lines (no 3-column structure)
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            # Status is the second-to-last field; type is last
+            # Format: " <name>  <status...>  <type>"
+            # Use the known status strings rather than positional parsing
+            status_col = " ".join(parts[1:-1])
+            if status_col in ("OK", "Not monitored"):
+                continue
+            service_name = parts[0]
+            logger.debug(f"  {node_name}: {service_name} -> {status_col}")
+            unhealthy.append(f"{service_name}={status_col}")
+
+        if unhealthy:
+            logger.warning(
+                f"Node '{node_name}' monit unhealthy: {', '.join(unhealthy)}"
+            )
+            return False
+
+        logger.debug(f"Node '{node_name}' monit reports all services OK")
+        return True
+
 
 # ==================== Maintenance Manager ====================
 
@@ -1359,12 +1400,17 @@ class MaintenanceManager:
                             f"Waiting for node '{node_name}' to go offline (current state: {node_state.state})"
                         )
                 else:
-                    # Reboot or revival: success = node is UP (not down)
+                    # Reboot or revival: success = node is UP (not down) and monit is healthy
                     if not is_down:
-                        logger.info(
-                            f"Node '{node_name}' is back online (state: {node_state.state})"
-                        )
-                        return True
+                        if self.controller.check_monit_healthy(node_name):
+                            logger.info(
+                                f"Node '{node_name}' is back online and healthy (state: {node_state.state})"
+                            )
+                            return True
+                        else:
+                            logger.debug(
+                                f"Node '{node_name}' is up in Slurm but monit reports unhealthy services; waiting"
+                            )
                     else:
                         logger.debug(
                             f"Waiting for node '{node_name}' to come back online (current state: {node_state.state})"
