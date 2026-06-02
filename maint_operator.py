@@ -756,8 +756,10 @@ def parse_duration_string(duration_str: str) -> pendulum.Duration:
 class SlurmController:
     """Interface to Slurm commands."""
 
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, dry_run: bool = False, post_reboot_hook: Optional[str] = None):
         self.dry_run = dry_run
+        self.post_reboot_hook = post_reboot_hook
+        self.hook_timeout = 60  # seconds
 
     def get_all_nodes(self) -> List[str]:
         """Get all node names in the cluster."""
@@ -1086,20 +1088,54 @@ class SlurmController:
         except (subprocess.CalledProcessError, ValueError):
             return None
 
-    def run_autoresume(self, node_name: str) -> None:
-        """Run autoresume-slurm.sh on the node to restore it to Slurm service."""
-        cmd = ["clush", "-w", node_name, "/usr/local/lib/monit/bin/autoresume-slurm.sh", "--now"]
-        logger.debug(f"Running autoresume on '{node_name}': {' '.join(cmd)}")
+    def run_post_reboot_hook(self, node_name: str) -> bool:
+        """
+        Run the configured post-reboot hook script on the node.
+
+        Default hook is autoresume-slurm.sh. Can be overridden via --post-reboot-hook.
+        Script is executed remotely on the node via clush.
+
+        Args:
+            node_name: Name of the node to run hook on
+
+        Returns:
+            True if hook succeeded, False otherwise (will retry on next poll)
+        """
+        if not self.post_reboot_hook:
+            logger.debug(f"No post-reboot hook configured for '{node_name}', skipping")
+            return True
+
+        # Build clush command to run script on node
+        cmd = ["clush", "-w", node_name, self.post_reboot_hook]
+
+        logger.info(f"Running post-reboot hook on '{node_name}': {self.post_reboot_hook}")
+        logger.debug(f"Hook command: {' '.join(cmd)}")
+
         if self.dry_run:
             logger.warning(f"[DRY-RUN] Would execute: {' '.join(cmd)}")
-            return
+            return True
+
         try:
-            subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
-            logger.debug(f"Node '{node_name}' autoresume completed")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=self.hook_timeout
+            )
+            logger.success(f"Post-reboot hook completed for '{node_name}'")
+            if result.stdout.strip():
+                logger.debug(f"Hook output: {result.stdout.strip()}")
+            return True
         except subprocess.TimeoutExpired:
-            logger.warning(f"autoresume-slurm.sh timed out on '{node_name}'")
+            logger.error(f"Post-reboot hook timed out on '{node_name}' after {self.hook_timeout}s")
+            return False
         except subprocess.CalledProcessError as e:
-            logger.warning(f"autoresume-slurm.sh failed on '{node_name}': {e.stderr.strip()}")
+            logger.error(f"Post-reboot hook failed on '{node_name}': {e.stderr.strip()}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error running post-reboot hook on '{node_name}': {e}")
+            return False
 
     def check_monit_healthy(self, node_name: str) -> bool:
         """Run 'monit summary -B' on node via clush and verify all services are OK or Not monitored."""
@@ -1171,6 +1207,7 @@ class MaintenanceManager:
         self.max_down_percentage = max_down_percentage
         self.reboot_timeout = reboot_timeout
         self.reservation_lead_time = reservation_lead_time  # minutes
+        self.post_reboot_delay = 300  # seconds
         self.state_file = state_file
         self.node_reboot_status: Dict[str, NodeRebootStatus] = {}
         self.target_nodes = set(target_nodes) if target_nodes else None
@@ -1486,20 +1523,42 @@ class MaintenanceManager:
             except Exception as e:
                 logger.warning(f"Failed to check node '{node_name}' state: {e}")
 
-        # Reboot or revival: boot time + monit are the source of truth
+        # Reboot or revival: boot time + delay + hook are the source of truth
         else:
             boot_time = self.controller.get_node_boot_time(node_name)
+
+            # Check 1: Has node rebooted yet?
             if boot_time is None or status.reboot_start_time is None or boot_time <= status.reboot_start_time:
                 logger.debug(
                     f"Node '{node_name}' has not rebooted yet (boot time: {boot_time})"
                 )
+            # Check 2: Is monit healthy?
             elif not self.controller.check_monit_healthy(node_name):
                 logger.debug(
                     f"Node '{node_name}' rebooted at {boot_time} but monit not yet healthy"
                 )
             else:
-                self.controller.run_autoresume(node_name)
-                logger.info(f"Node '{node_name}' is back online and healthy (booted at {boot_time})")
+                # Check 3: Has post-reboot delay elapsed since boot?
+                # Delay measured from boot_time (when reboot detected)
+                elapsed_since_boot = (datetime.now() - boot_time).total_seconds()
+                if elapsed_since_boot < self.post_reboot_delay:
+                    remaining = self.post_reboot_delay - elapsed_since_boot
+                    logger.debug(
+                        f"Node '{node_name}' is healthy but waiting {remaining:.0f}s "
+                        f"before post-reboot hook (delay: {self.post_reboot_delay}s)"
+                    )
+                    return False
+
+                # Node is ready: run post-reboot hook
+                # If hook fails, retry on next poll (return False, stay in REBOOTING)
+                if not self.controller.run_post_reboot_hook(node_name):
+                    logger.warning(f"Post-reboot hook failed for '{node_name}', will retry next iteration")
+                    return False
+
+                logger.info(
+                    f"Node '{node_name}' is back online and healthy "
+                    f"(booted at {boot_time}, hook completed after {elapsed_since_boot:.0f}s)"
+                )
                 return True
 
         # Check for timeout
@@ -1652,12 +1711,13 @@ def run_operator(
     decommission: bool = False,
     revive: bool = False,
     enable_decommission: bool = False,
+    post_reboot_hook: Optional[str] = None,
 ) -> None:
     """
     Main operator loop that creates reservations and manages reboots.
     """
 
-    controller = SlurmController(dry_run=dry_run)
+    controller = SlurmController(dry_run=dry_run, post_reboot_hook=post_reboot_hook)
     reservation_manager = ReservationManager(dry_run=dry_run)
 
     # Get target nodes
@@ -2161,6 +2221,13 @@ def run_operator(
     show_default=True,
 )
 @click.option(
+    "--post-reboot-hook",
+    type=str,
+    default="/usr/local/lib/monit/bin/autoresume-slurm.sh --now",
+    help="Path to script to run after node reboot completes (executed via clush on each node)",
+    show_default=True,
+)
+@click.option(
     "--enable-reservations",
     is_flag=True,
     help="Enable creation of maintenance reservations",
@@ -2233,6 +2300,7 @@ def main(
     reservation_duration: str,
     reservation_lead_time: int,
     reboot_timeout: int,
+    post_reboot_hook: Optional[str],
     enable_reservations: bool,
     enable_reboots: bool,
     decommission: bool,
@@ -2344,6 +2412,7 @@ def main(
         decommission=decommission,
         revive=revive,
         enable_decommission=enable_decommission,
+        post_reboot_hook=post_reboot_hook,
     )
 
 
