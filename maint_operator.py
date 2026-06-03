@@ -2283,6 +2283,7 @@ def run_operator(
     "--flags",
     "-f",
     help="Reservation flags (e.g., MAINT,IGNORE_JOBS)",
+    default="MAINT",
 )
 @click.option(
     "--verbose",
