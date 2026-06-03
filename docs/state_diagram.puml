@@ -1,4 +1,6 @@
 @startuml
+title Slurm Maintenance Operator - Node State Machine
+
 skinparam state {
   ' States for normal, in-progress workflow
   BackgroundColor<<inprogress>> #E3F2FD
@@ -12,11 +14,15 @@ skinparam state {
   BackgroundColor<<failure>> #FFEBEE
   BorderColor<<failure>> #B71C1C
 
-  ' Original user-defined states
+  ' Decommission-specific states
   BackgroundColor<<decommission>> #FFE0B2
   BorderColor<<decommission>> #E65100
+
+  ' Choice/branching states
   BackgroundColor<<choice>> #F3E5F5
   BorderColor<<choice>> #6A1B9A
+
+  ' External/untracked states
   BackgroundColor<<external>> #F5F5F5
   BorderColor<<external>> #9E9E9E
 }
@@ -26,48 +32,52 @@ skinparam state {
 state UNTRACKED<<external>> : Node is active in partition,\nrunning jobs normally,\nnot tracked by operator
 
 state entry_branch<<choice>>
-UNTRACKED --> entry_branch
+UNTRACKED --> entry_branch : Operator detects node
 
-entry_branch --> RESERVATION_PENDING  : [--enable-reservations]\nPhase 1: no existing reservation\nfound for node
-entry_branch --> PENDING              : [--decommission]\nmark_node_for_decommission()
+entry_branch --> RESERVATION_PENDING  : [--enable-reservations]\nPhase 1: no existing reservation\nfor node
+entry_branch --> PENDING              : [Phase 2: reservation is active]\nmark_node_for_reboot()
 
-state RESERVATION_PENDING<<inprogress>> : Calculating reservation start time\nbased on running jobs:\n- no jobs → start now\n- preemptable jobs → after longest\n- regular jobs → after longest
+state RESERVATION_PENDING<<inprogress>> : Calculating reservation\nstart time based on running jobs:\n• No jobs → start now (T+1s)\n• Preemptable only → after longest\n  (or now if --terminate-preemptable-jobs)\n• Regular jobs → after longest job end\n• Mixed → after longest regular job
 
-RESERVATION_PENDING --> DRAINING      : Reservation created\n(scontrol create reservation\nmaint-$USER:{node_name})
+RESERVATION_PENDING --> DRAINING      : Reservation created\n(scontrol create reservation\nmaint-$USER:{node_name})\nstart_time, duration, user, account, flags
 
-state DRAINING<<inprogress>> : Reservation active; Slurm blocks\nnew jobs. Existing jobs run to\ncompletion. Node unavailable\nto the scheduler.
+state DRAINING<<inprogress>> : Reservation is active.
 
-DRAINING --> PENDING                  : All jobs drained\n(or preemptable jobs\nterminated via --terminate-\npreemptable-jobs)
+DRAINING --> PENDING                  : [--enable-reboots]\nAll jobs drained, reservation active\nmark_node_for_reboot()
 
-state PENDING<<inprogress>> : Queued for reboot.\nWaiting for capacity:\ncombined unavailable+down\n< --max-down-percentage
+state PENDING<<inprogress>> : **RebootState.PENDING**\nQueued for operation.\nWaiting for capacity
 
-PENDING --> REBOOTING                 : Capacity available\n(issue_reboot())
+state operation_dispatch<<choice>>
+PENDING --> operation_dispatch        : Capacity available
 
-state REBOOTING<<inprogress>> : Reboot command issued.\nAwaiting node shutdown.
+operation_dispatch --> REBOOTING      : issue_reboot(node_name)\nscontrol reboot ASAP {node}
 
-state fork<<choice>>
-REBOOTING --> fork                    : Node goes down
+state REBOOTING<<inprogress>> : **RebootState.REBOOTING**\nOperation command issued.
 
-fork --> RECOVERING                   : [maintenance_type == REBOOT]
-fork --> AWAITING_REVIVAL             : [maintenance_type == DECOMMISSION]
+state recovery_branch<<choice>>
+REBOOTING --> recovery_branch         : monitor_node_recovery()
 
-state RECOVERING<<inprogress>> : Node is down. Polling for\nreturn to service via\nmonitor_node_recovery().
+recovery_branch --> RECOVERING        : Node rebooting, checking BootTime
 
-state AWAITING_REVIVAL<<decommission>> : Hardware retired.\nParked indefinitely; no timeout.\nStill counts as unavailable.
+state RECOVERING<<inprogress>> : **RebootState.REBOOTING** (still)\nNode is down. Polling for recovery.
 
-RECOVERING --> COMPLETED              : Node back online;\nSlurm reports healthy
-RECOVERING --> FAILED                 : Timeout exceeded
+RECOVERING --> COMPLETED              : All recovery checks pass:\n1. BootTime updated\n2. monit healthy\n3. post_reboot_delay elapsed\n4. post-reboot hook succeeded\n\ncomplete_node_reboot()
 
-REBOOTING --> FAILED                  : Timeout exceeded
+state timeout_check<<choice>>
+REBOOTING --> timeout_check           : Elapsed time >\n--reboot-timeout
 
-AWAITING_REVIVAL --> DRAINING         : mark_node_for_revival()\n(<U+002D><U+002D>revive <U+002D><U+002D>nodelist)
+timeout_check --> FAILED              : [attempts >= max_attempts]\nMax retries exhausted
+timeout_check --> PENDING             : [attempts < max_attempts]\nReset to PENDING for retry
 
-state FAILED<<failure>> : Reboot attempt failed.\nAttempt counter incremented.
+RECOVERING --> timeout_check          : Elapsed time >\n--reboot-timeout
 
-FAILED --> PENDING                    : [attempts < max_attempts]\nauto-retry
-FAILED --> [*]                        : [attempts == max_attempts]\nmanual intervention required
+state FAILED<<failure>> : **RebootState.FAILED**\nOperation failed after max attempts.
 
-state COMPLETED<<success>> : Node healthy and back\nin Slurm service.
-COMPLETED --> UNTRACKED               : State file entry\nexpires after 24h
+state COMPLETED<<success>> : **RebootState.COMPLETED**\nNode successfully rebooted/revived.
+
+COMPLETED --> [*]
+
+FAILED --> [*]
+
 
 @enduml
