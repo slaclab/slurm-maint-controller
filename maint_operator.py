@@ -756,9 +756,10 @@ def parse_duration_string(duration_str: str) -> pendulum.Duration:
 class SlurmController:
     """Interface to Slurm commands."""
 
-    def __init__(self, dry_run: bool = False, post_reboot_hook: Optional[str] = None):
+    def __init__(self, dry_run: bool = False, post_reboot_hook: Optional[str] = None, pre_reboot_hook: Optional[str] = None):
         self.dry_run = dry_run
         self.post_reboot_hook = post_reboot_hook
+        self.pre_reboot_hook = pre_reboot_hook
         self.hook_timeout = 60  # seconds
 
     def get_all_nodes(self) -> List[str]:
@@ -1137,6 +1138,59 @@ class SlurmController:
             logger.error(f"Unexpected error running post-reboot hook on '{node_name}': {e}")
             return False
 
+    def run_pre_reboot_hook(self, node_name: str) -> bool:
+        """
+        Run the configured pre-reboot hook script on the node.
+
+        Hook runs BEFORE the reboot command is issued. Can be used for:
+        - Pre-reboot validation checks
+        - State backup
+        - Notifications
+        - Custom preparation steps
+
+        Args:
+            node_name: Name of the node to run hook on
+
+        Returns:
+            True if hook succeeded or no hook configured
+            False if hook failed (will block reboot and retry)
+        """
+        if not self.pre_reboot_hook:
+            logger.debug(f"No pre-reboot hook configured for '{node_name}', skipping")
+            return True
+
+        # Build clush command to run script on node
+        cmd = ["clush", "-w", node_name, self.pre_reboot_hook]
+
+        logger.info(f"Running pre-reboot hook on '{node_name}': {self.pre_reboot_hook}")
+        logger.debug(f"Hook command: {' '.join(cmd)}")
+
+        if self.dry_run:
+            logger.warning(f"[DRY-RUN] Would execute: {' '.join(cmd)}")
+            return True
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=self.hook_timeout
+            )
+            logger.success(f"Pre-reboot hook completed for '{node_name}'")
+            if result.stdout.strip():
+                logger.debug(f"Hook output: {result.stdout.strip()}")
+            return True
+        except subprocess.TimeoutExpired:
+            logger.error(f"Pre-reboot hook timed out on '{node_name}' after {self.hook_timeout}s")
+            return False
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Pre-reboot hook failed on '{node_name}': {e.stderr.strip()}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error running pre-reboot hook on '{node_name}': {e}")
+            return False
+
     def check_monit_healthy(self, node_name: str) -> bool:
         """Run 'monit summary -B' on node via clush and verify all services are OK or Not monitored."""
         cmd = ["clush", "-w", node_name, "sudo", "monit", "summary", "-B"]
@@ -1451,6 +1505,15 @@ class MaintenanceManager:
             )
             return False
 
+        # Run pre-reboot hook
+        # If hook fails, block the reboot - node stays PENDING and will retry
+        if not self.controller.run_pre_reboot_hook(node_name):
+            logger.warning(
+                f"Pre-reboot hook failed for '{node_name}', reboot blocked - "
+                f"will retry next iteration (attempt {status.attempts + 1}/{status.max_attempts})"
+            )
+            return False
+
         # Issue the reboot command via scontrol
         if not self.controller.reboot_node(node_name, asap=True):
             return False
@@ -1712,12 +1775,13 @@ def run_operator(
     revive: bool = False,
     enable_decommission: bool = False,
     post_reboot_hook: Optional[str] = None,
+    pre_reboot_hook: Optional[str] = None,
 ) -> None:
     """
     Main operator loop that creates reservations and manages reboots.
     """
 
-    controller = SlurmController(dry_run=dry_run, post_reboot_hook=post_reboot_hook)
+    controller = SlurmController(dry_run=dry_run, post_reboot_hook=post_reboot_hook, pre_reboot_hook=pre_reboot_hook)
     reservation_manager = ReservationManager(dry_run=dry_run)
 
     # Get target nodes
@@ -2228,6 +2292,14 @@ def run_operator(
     show_default=True,
 )
 @click.option(
+    "--pre-reboot-hook",
+    type=str,
+    default=None,
+    help="Path to script to run before node reboot (executed via clush on each node). "
+         "Hook failure blocks the reboot.",
+    show_default=True,
+)
+@click.option(
     "--enable-reservations",
     is_flag=True,
     help="Enable creation of maintenance reservations",
@@ -2302,6 +2374,7 @@ def main(
     reservation_lead_time: int,
     reboot_timeout: int,
     post_reboot_hook: Optional[str],
+    pre_reboot_hook: Optional[str],
     enable_reservations: bool,
     enable_reboots: bool,
     decommission: bool,
@@ -2414,6 +2487,7 @@ def main(
         revive=revive,
         enable_decommission=enable_decommission,
         post_reboot_hook=post_reboot_hook,
+        pre_reboot_hook=pre_reboot_hook,
     )
 
 
