@@ -35,6 +35,8 @@ import click
 import pendulum
 from loguru import logger
 
+USER = os.getenv("USER", "UNKONWN")
+
 # ==================== Data Classes ====================
 
 
@@ -185,6 +187,7 @@ class NodeRebootStatus:
     attempts: int = 0
     max_attempts: int = 3
     is_revival: bool = False  # True when DECOMMISSION node is being revived
+    seen_down: bool = False  # True once node has been observed DOWN after reboot issued
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -202,6 +205,7 @@ class NodeRebootStatus:
             "attempts": self.attempts,
             "max_attempts": self.max_attempts,
             "is_revival": self.is_revival,
+            "seen_down": self.seen_down,
         }
 
     @staticmethod
@@ -220,7 +224,8 @@ class NodeRebootStatus:
             else None,
             attempts=data["attempts"],
             max_attempts=data["max_attempts"],
-            is_revival=data.get("is_revival", False),  # Backward compatibility
+            is_revival=data.get("is_revival", False),
+            seen_down=data.get("seen_down", False),
         )
 
 
@@ -348,7 +353,7 @@ class Reservation:
 
     def is_maintenance_reservation(self) -> bool:
         """Check if this is a maintenance reservation."""
-        return self.name.startswith("maint-op:")
+        return self.name.startswith(f"maint-{USER}:")
 
     def is_active(self) -> bool:
         """Check if reservation is currently active."""
@@ -393,7 +398,7 @@ class Reservation:
         """
         Get the node name from a maintenance reservation.
 
-        For maintenance reservations with format 'maint:nodename',
+        For maintenance reservations with format 'maint-$USER:nodename',
         returns the node name. Otherwise returns the first node.
         """
         if self.is_maintenance_reservation():
@@ -519,7 +524,7 @@ class ReservationManager:
 
     def get_maintenance(self) -> List[Reservation]:
         """
-        Get all maintenance reservations (name starts with 'maint:').
+        Get all maintenance reservations (name starts with 'maint-$USER:').
 
         Returns:
             List of Reservation objects for maintenance reservations
@@ -644,9 +649,13 @@ class ReservationManager:
         Returns:
             True if successful, False otherwise
         """
-        cmd = ["scontrol", "delete", "reservation", reservation.name]
+        return self.delete_by_name(reservation.name)
 
-        logger.info(f"Deleting reservation: {reservation.name}")
+    def delete_by_name(self, name: str) -> bool:
+        """Delete a reservation from Slurm by name."""
+        cmd = ["scontrol", "delete", "reservation", name]
+
+        logger.info(f"Deleting reservation: {name}")
         logger.debug(f"Command: {' '.join(cmd)}")
 
         if self.dry_run:
@@ -747,8 +756,11 @@ def parse_duration_string(duration_str: str) -> pendulum.Duration:
 class SlurmController:
     """Interface to Slurm commands."""
 
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, dry_run: bool = False, post_reboot_hook: Optional[str] = None, pre_reboot_hook: Optional[str] = None):
         self.dry_run = dry_run
+        self.post_reboot_hook = post_reboot_hook
+        self.pre_reboot_hook = pre_reboot_hook
+        self.hook_timeout = 60  # seconds
 
     def get_all_nodes(self) -> List[str]:
         """Get all node names in the cluster."""
@@ -905,6 +917,30 @@ class SlurmController:
             logger.debug(f"No jobs found on node {node_name}: {e.stderr}")
             return JobList([])
 
+    def get_node_states_by_names(self, node_names: List[str]) -> Dict[str, NodeState]:
+        """Get the state of specific nodes by name, regardless of partition."""
+        node_states = {}
+        for node in node_names:
+            found = False
+            try:
+                cmd = ["sinfo", "-h", "-n", node, "-o", "%n|%T"]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                for line in result.stdout.strip().split("\n"):
+                    if not line.strip():
+                        continue
+                    parts = line.split("|")
+                    if len(parts) != 2:
+                        continue
+                    node_name = parts[0]
+                    state = parts[1]
+                    node_states[node_name] = NodeState(name=node_name, state=state)
+                    found = True
+                if not found:
+                    logger.warning(f"Node '{node}' not found in Slurm output for sinfo -n {node}.")
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"Failed to get state for node '{node}': {e.stderr}")
+        return node_states
+
     def _parse_time_limit(self, time_str: str) -> pendulum.Duration:
         """Parse Slurm time limit format."""
         if time_str == "UNLIMITED" or time_str == "NOT_SET":
@@ -1005,6 +1041,204 @@ class SlurmController:
             logger.error(f"Failed to mark '{node_name}' as DOWN: {e.stderr}")
             return False
 
+    def clear_node_down(self, node_name: str) -> bool:
+        """Clear the DOWN+DRAIN state left by a reboot cycle, warning if Slurm flagged a timeout."""
+        try:
+            result = subprocess.run(
+                ["scontrol", "show", "node", "-o", node_name],
+                capture_output=True, text=True, check=True,
+            )
+            match = re.search(r"Reason=([^\s].*?)(?:\s+\[|$)", result.stdout)
+            if match:
+                reason = match.group(1).strip()
+                if "timed out" in reason.lower():
+                    logger.warning(
+                        f"Node '{node_name}' had Slurm reboot timeout reason before clearing: "
+                        f"'{reason}' — consider increasing --reboot-timeout if this recurs"
+                    )
+        except subprocess.CalledProcessError:
+            pass
+
+        cmd = ["scontrol", "update", f"NodeName={node_name}", "State=resume"]
+        logger.debug(f"Clearing down state for '{node_name}': {' '.join(cmd)}")
+        if self.dry_run:
+            logger.warning(f"[DRY-RUN] Would execute: {' '.join(cmd)}")
+            return True
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            logger.debug(f"Node '{node_name}' down state cleared")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to clear down state for '{node_name}': {e.stderr.strip()}")
+            return False
+
+    def get_node_boot_time(self, node_name: str) -> Optional[datetime]:
+        """Return the BootTime of a node from scontrol, or None if unavailable."""
+        try:
+            result = subprocess.run(
+                ["scontrol", "show", "node", "-o", node_name],
+                capture_output=True, text=True, check=True,
+            )
+            match = re.search(r"BootTime=(\S+)", result.stdout)
+            if not match:
+                return None
+            raw = match.group(1)
+            if raw in ("None", "Unknown", "N/A"):
+                return None
+            return datetime.fromisoformat(raw)
+        except (subprocess.CalledProcessError, ValueError):
+            return None
+
+    def run_post_reboot_hook(self, node_name: str) -> bool:
+        """
+        Run the configured post-reboot hook script on the node.
+
+        Default hook is autoresume-slurm.sh. Can be overridden via --post-reboot-hook.
+        Script is executed remotely on the node via clush.
+
+        Args:
+            node_name: Name of the node to run hook on
+
+        Returns:
+            True if hook succeeded, False otherwise (will retry on next poll)
+        """
+        if not self.post_reboot_hook:
+            logger.debug(f"No post-reboot hook configured for '{node_name}', skipping")
+            return True
+
+        # Build clush command to run script on node
+        cmd = ["clush", "-w", node_name, self.post_reboot_hook]
+
+        logger.info(f"Running post-reboot hook on '{node_name}': {self.post_reboot_hook}")
+        logger.debug(f"Hook command: {' '.join(cmd)}")
+
+        if self.dry_run:
+            logger.warning(f"[DRY-RUN] Would execute: {' '.join(cmd)}")
+            return True
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=self.hook_timeout
+            )
+            logger.success(f"Post-reboot hook completed for '{node_name}'")
+            if result.stdout.strip():
+                logger.debug(f"Hook output: {result.stdout.strip()}")
+            return True
+        except subprocess.TimeoutExpired:
+            logger.error(f"Post-reboot hook timed out on '{node_name}' after {self.hook_timeout}s")
+            return False
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Post-reboot hook failed on '{node_name}': {e.stderr.strip()}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error running post-reboot hook on '{node_name}': {e}")
+            return False
+
+    def run_pre_reboot_hook(self, node_name: str) -> bool:
+        """
+        Run the configured pre-reboot hook script on the node.
+
+        Hook runs BEFORE the reboot command is issued. Can be used for:
+        - Pre-reboot validation checks
+        - State backup
+        - Notifications
+        - Custom preparation steps
+
+        Args:
+            node_name: Name of the node to run hook on
+
+        Returns:
+            True if hook succeeded or no hook configured
+            False if hook failed (will block reboot and retry)
+        """
+        if not self.pre_reboot_hook:
+            logger.debug(f"No pre-reboot hook configured for '{node_name}', skipping")
+            return True
+
+        # Build clush command to run script on node
+        cmd = ["clush", "-w", node_name, self.pre_reboot_hook]
+
+        logger.info(f"Running pre-reboot hook on '{node_name}': {self.pre_reboot_hook}")
+        logger.debug(f"Hook command: {' '.join(cmd)}")
+
+        if self.dry_run:
+            logger.warning(f"[DRY-RUN] Would execute: {' '.join(cmd)}")
+            return True
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=self.hook_timeout
+            )
+            logger.success(f"Pre-reboot hook completed for '{node_name}'")
+            if result.stdout.strip():
+                logger.debug(f"Hook output: {result.stdout.strip()}")
+            return True
+        except subprocess.TimeoutExpired:
+            logger.error(f"Pre-reboot hook timed out on '{node_name}' after {self.hook_timeout}s")
+            return False
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Pre-reboot hook failed on '{node_name}': {e.stderr.strip()}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error running pre-reboot hook on '{node_name}': {e}")
+            return False
+
+    def check_monit_healthy(self, node_name: str) -> bool:
+        """Run 'monit summary -B' on node via clush and verify all services are OK or Not monitored."""
+        cmd = ["clush", "-w", node_name, "sudo", "monit", "summary", "-B"]
+        logger.debug(f"Checking monit health on '{node_name}': {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            logger.debug(f"Node '{node_name}' monit check timed out — node likely still unreachable")
+            return False
+        except subprocess.CalledProcessError as e:
+            # Exit 255 = SSH connection failed (node is down/unreachable)
+            if e.returncode == 255:
+                logger.debug(f"Node '{node_name}' is unreachable via SSH — still coming up")
+            else:
+                logger.warning(f"monit summary failed on '{node_name}' (exit {e.returncode}): {e.stderr.strip()}")
+            return False
+        except FileNotFoundError:
+            logger.warning("clush not found; skipping monit health check")
+            return True
+
+        unhealthy = []
+        for line in result.stdout.splitlines():
+            # Strip clush node prefix (e.g. "nodename: ")
+            if ": " in line:
+                line = line.split(": ", 1)[1]
+            # Skip header/blank lines (no 3-column structure)
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            # Status is the second-to-last field; type is last
+            # Format: " <name>  <status...>  <type>"
+            # Use the known status strings rather than positional parsing
+            status_col = " ".join(parts[1:-1])
+            if status_col in ("OK", "Not monitored"):
+                continue
+            service_name = parts[0]
+            logger.debug(f"  {node_name}: {service_name} -> {status_col}")
+            unhealthy.append(f"{service_name}={status_col}")
+
+        if unhealthy:
+            logger.warning(
+                f"Node '{node_name}' monit unhealthy: {', '.join(unhealthy)}"
+            )
+            return False
+
+        logger.debug(f"Node '{node_name}' monit reports all services OK")
+        return True
+
 
 # ==================== Maintenance Manager ====================
 
@@ -1020,14 +1254,17 @@ class MaintenanceManager:
         reboot_timeout: int = 600,
         reservation_lead_time: int = 60,
         state_file: Optional[str] = None,
+        target_nodes: Optional[List[str]] = None,
     ):
         self.controller = controller
         self.reservation_manager = reservation_manager
         self.max_down_percentage = max_down_percentage
         self.reboot_timeout = reboot_timeout
         self.reservation_lead_time = reservation_lead_time  # minutes
+        self.post_reboot_delay = 300  # seconds
         self.state_file = state_file
         self.node_reboot_status: Dict[str, NodeRebootStatus] = {}
+        self.target_nodes = set(target_nodes) if target_nodes else None
 
         if self.state_file:
             self.load_state()
@@ -1094,7 +1331,31 @@ class MaintenanceManager:
         Returns:
             Tuple of (down_count, total_count, down_node_set)
         """
-        # Get partition info
+        # If target_nodes is set (from --nodelist), use that for node state queries
+        if self.target_nodes is not None:
+            target_nodes = list(self.target_nodes)
+            total_nodes = len(target_nodes)
+            if total_nodes == 0:
+                return (0, 0, set())
+            logger.debug("Refreshing node states from Slurm for explicit nodelist")
+            node_states = self.controller.get_node_states_by_names(target_nodes)
+            completed_nodes = {
+                n for n, s in self.node_reboot_status.items()
+                if s.state == RebootState.COMPLETED
+            }
+            down_nodes = set()
+            for node_name in target_nodes:
+                if node_name in completed_nodes:
+                    continue
+                if node_name in node_states and node_states[node_name].is_down():
+                    down_nodes.add(node_name)
+            down_count = len(down_nodes)
+            logger.debug(
+                f"Found {down_count} down nodes in nodelist: {','.join(sorted(down_nodes)) if down_nodes else '(none)'}"
+            )
+            return (down_count, total_nodes, down_nodes)
+
+        # Otherwise, use partition-based logic
         partition_info_list = self.controller.get_partition_info(partition)
         if not partition_info_list:
             logger.error(f"Could not get info for partition '{partition}'")
@@ -1107,12 +1368,17 @@ class MaintenanceManager:
         if total_nodes == 0:
             return (0, 0, set())
 
-        # Get node states from Slurm (refreshed on every call)
         logger.debug(f"Refreshing node states from Slurm for partition '{partition}'")
         node_states = self.controller.get_node_states(partition)
 
         down_nodes = set()
+        completed_nodes = {
+            n for n, s in self.node_reboot_status.items()
+            if s.state == RebootState.COMPLETED
+        }
         for node_name in partition_nodes:
+            if node_name in completed_nodes:
+                continue
             if node_name in node_states and node_states[node_name].is_down():
                 down_nodes.add(node_name)
 
@@ -1239,6 +1505,15 @@ class MaintenanceManager:
             )
             return False
 
+        # Run pre-reboot hook
+        # If hook fails, block the reboot - node stays PENDING and will retry
+        if not self.controller.run_pre_reboot_hook(node_name):
+            logger.warning(
+                f"Pre-reboot hook failed for '{node_name}', reboot blocked - "
+                f"will retry next iteration (attempt {status.attempts + 1}/{status.max_attempts})"
+            )
+            return False
+
         # Issue the reboot command via scontrol
         if not self.controller.reboot_node(node_name, asap=True):
             return False
@@ -1246,6 +1521,7 @@ class MaintenanceManager:
         status.state = RebootState.REBOOTING
         status.reboot_start_time = datetime.now()
         status.attempts += 1
+        status.seen_down = False
 
         logger.info(
             f"Node '{node_name}' reboot initiated (attempt {status.attempts}/{status.max_attempts})"
@@ -1273,6 +1549,7 @@ class MaintenanceManager:
         status.state = RebootState.REBOOTING  # Transition to monitoring state
         status.reboot_start_time = datetime.now()
         status.attempts += 1
+        status.seen_down = False
 
         logger.info(
             f"Node '{node_name}' decommission initiated (attempt {status.attempts}/{status.max_attempts})"
@@ -1289,22 +1566,15 @@ class MaintenanceManager:
         if status.state != RebootState.REBOOTING:
             return status.state == RebootState.COMPLETED
 
-        # Get current node state from Slurm
-        try:
-            node_states = self.controller.get_node_states(status.partition)
-            if node_name not in node_states:
-                logger.warning(
-                    f"Node '{node_name}' not found in Slurm partition '{status.partition}'"
-                )
-                # Continue checking - node might be temporarily unavailable during reboot
-            else:
-                node_state = node_states[node_name]
-                is_down = node_state.is_down()
-
-                # Determine success based on operation type
-                if status.maintenance_type == MaintananceType.DECOMMISSION and not status.is_revival:
-                    # Initial decommission (shutdown): success = node is DOWN
-                    if is_down:
+        # Decommission (shutdown): use Slurm state as source of truth
+        if status.maintenance_type == MaintananceType.DECOMMISSION and not status.is_revival:
+            try:
+                node_states = self.controller.get_node_states_by_names([node_name])
+                if node_name not in node_states:
+                    logger.warning(f"Node '{node_name}' not found in Slurm")
+                else:
+                    node_state = node_states[node_name]
+                    if node_state.is_down():
                         logger.info(
                             f"Node '{node_name}' shutdown completed - node is offline (state: {node_state.state})"
                         )
@@ -1313,21 +1583,46 @@ class MaintenanceManager:
                         logger.debug(
                             f"Waiting for node '{node_name}' to go offline (current state: {node_state.state})"
                         )
-                else:
-                    # Reboot or revival: success = node is UP (not down)
-                    if not is_down:
-                        logger.info(
-                            f"Node '{node_name}' is back online (state: {node_state.state})"
-                        )
-                        return True
-                    else:
-                        logger.debug(
-                            f"Waiting for node '{node_name}' to come back online (current state: {node_state.state})"
-                        )
+            except Exception as e:
+                logger.warning(f"Failed to check node '{node_name}' state: {e}")
 
-        except Exception as e:
-            logger.warning(f"Failed to check node '{node_name}' state: {e}")
-            # Don't fail immediately - might be transient
+        # Reboot or revival: boot time + delay + hook are the source of truth
+        else:
+            boot_time = self.controller.get_node_boot_time(node_name)
+
+            # Check 1: Has node rebooted yet?
+            if boot_time is None or status.reboot_start_time is None or boot_time <= status.reboot_start_time:
+                logger.debug(
+                    f"Node '{node_name}' has not rebooted yet (boot time: {boot_time})"
+                )
+            # Check 2: Is monit healthy?
+            elif not self.controller.check_monit_healthy(node_name):
+                logger.debug(
+                    f"Node '{node_name}' rebooted at {boot_time} but monit not yet healthy"
+                )
+            else:
+                # Check 3: Has post-reboot delay elapsed since boot?
+                # Delay measured from boot_time (when reboot detected)
+                elapsed_since_boot = (datetime.now() - boot_time).total_seconds()
+                if elapsed_since_boot < self.post_reboot_delay:
+                    remaining = self.post_reboot_delay - elapsed_since_boot
+                    logger.debug(
+                        f"Node '{node_name}' is healthy but waiting {remaining:.0f}s "
+                        f"before post-reboot hook (delay: {self.post_reboot_delay}s)"
+                    )
+                    return False
+
+                # Node is ready: run post-reboot hook
+                # If hook fails, retry on next poll (return False, stay in REBOOTING)
+                if not self.controller.run_post_reboot_hook(node_name):
+                    logger.warning(f"Post-reboot hook failed for '{node_name}', will retry next iteration")
+                    return False
+
+                logger.info(
+                    f"Node '{node_name}' is back online and healthy "
+                    f"(booted at {boot_time}, hook completed after {elapsed_since_boot:.0f}s)"
+                )
+                return True
 
         # Check for timeout
         if status.reboot_start_time:
@@ -1349,51 +1644,6 @@ class MaintenanceManager:
                 return False
 
         return False
-
-    def complete_node_reboot(self, node_name: str) -> bool:
-        """Mark a node reboot/shutdown as completed."""
-        if node_name not in self.node_reboot_status:
-            return False
-
-        status = self.node_reboot_status[node_name]
-
-        # For DECOMMISSION nodes that were shut down (not revival), move to AWAITING_REVIVAL
-        # For REBOOT nodes or DECOMMISSION revivals, move to COMPLETED
-        if status.maintenance_type == MaintananceType.DECOMMISSION and not status.is_revival:
-            status.state = RebootState.AWAITING_REVIVAL
-            logger.success(
-                f"Node '{node_name}' shutdown completed successfully - awaiting revival"
-            )
-        else:
-            status.state = RebootState.COMPLETED
-            status.reboot_complete_time = datetime.now()
-            # Reset is_revival flag after successful revival
-            if status.is_revival:
-                status.is_revival = False
-            logger.success(f"Node '{node_name}' reboot completed successfully")
-
-        return True
-
-    def get_nodes_by_state(
-        self, state: RebootState, partition: Optional[str] = None
-    ) -> List[str]:
-        """Get list of nodes in a specific reboot state."""
-        nodes = []
-        for node_name, status in self.node_reboot_status.items():
-            if status.state == state:
-                if partition is None or status.partition == partition:
-                    nodes.append(node_name)
-        return nodes
-
-    def get_reboot_summary(self, partition: Optional[str] = None) -> Dict[str, int]:
-        """Get summary of reboot states."""
-        summary = {state.value: 0 for state in RebootState}
-
-        for status in self.node_reboot_status.values():
-            if partition is None or status.partition == partition:
-                summary[status.state.value] += 1
-
-        return summary
 
     def save_state(self) -> None:
         """Save reboot state to file."""
@@ -1438,6 +1688,51 @@ class MaintenanceManager:
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
 
+    def complete_node_reboot(self, node_name: str) -> bool:
+        """Mark a node reboot/shutdown as completed."""
+        if node_name not in self.node_reboot_status:
+            return False
+
+        status = self.node_reboot_status[node_name]
+
+        # For DECOMMISSION nodes that were shut down (not revival), move to AWAITING_REVIVAL
+        # For REBOOT nodes or DECOMMISSION revivals, move to COMPLETED
+        if status.maintenance_type == MaintananceType.DECOMMISSION and not status.is_revival:
+            status.state = RebootState.AWAITING_REVIVAL
+            logger.success(
+                f"Node '{node_name}' shutdown completed successfully - awaiting revival"
+            )
+        else:
+            status.state = RebootState.COMPLETED
+            status.reboot_complete_time = datetime.now()
+            # Reset is_revival flag after successful revival
+            if status.is_revival:
+                status.is_revival = False
+            self.controller.clear_node_down(node_name)
+            logger.success(f"Node '{node_name}' reboot completed successfully")
+
+        return True
+
+    def get_nodes_by_state(
+        self, state: RebootState, partition: Optional[str] = None
+    ) -> List[str]:
+        """Get list of nodes in a specific reboot state, filtered by target_nodes if set."""
+        nodes = []
+        for node_name, status in self.node_reboot_status.items():
+            if status.state == state:
+                if partition is None or status.partition == partition:
+                    if self.target_nodes is None or node_name in self.target_nodes:
+                        nodes.append(node_name)
+        return nodes
+
+    def get_reboot_summary(self, partition: Optional[str] = None) -> Dict[str, int]:
+        """Get summary of reboot states."""
+        summary = {state.value: 0 for state in RebootState}
+        for status in self.node_reboot_status.values():
+            if partition is None or status.partition == partition:
+                summary[status.state.value] += 1
+        return summary
+
     def clear_completed_nodes(self, max_age_hours: int = 24) -> None:
         """Remove old completed/failed nodes from tracking."""
         cutoff_time = datetime.now() - timedelta(hours=max_age_hours)
@@ -1479,12 +1774,22 @@ def run_operator(
     decommission: bool = False,
     revive: bool = False,
     enable_decommission: bool = False,
+    post_reboot_hook: Optional[str] = None,
+    pre_reboot_hook: Optional[str] = None,
 ) -> None:
     """
     Main operator loop that creates reservations and manages reboots.
     """
-    controller = SlurmController(dry_run=dry_run)
+
+    controller = SlurmController(dry_run=dry_run, post_reboot_hook=post_reboot_hook, pre_reboot_hook=pre_reboot_hook)
     reservation_manager = ReservationManager(dry_run=dry_run)
+
+    # Get target nodes
+    if nodelist:
+        target_nodes = list(expand_slurm_nodelist(nodelist))
+    else:
+        target_nodes = controller.get_all_nodes()
+
     manager = MaintenanceManager(
         controller=controller,
         reservation_manager=reservation_manager,
@@ -1492,6 +1797,7 @@ def run_operator(
         reboot_timeout=reboot_timeout,
         reservation_lead_time=reservation_lead_time,
         state_file=state_file,
+        target_nodes=target_nodes,
     )
 
     logger.info(f"Starting Slurm Maintenance Operator (interval: {interval}s)")
@@ -1508,12 +1814,6 @@ def run_operator(
     logger.info(f"  Decommission enabled: {enable_decommission}")
     logger.info(f"  Terminate preemptable: {terminate_preemptable_jobs}")
     logger.info(f"  Dry run: {dry_run}")
-
-    # Get target nodes
-    if nodelist:
-        target_nodes = list(expand_slurm_nodelist(nodelist))
-    else:
-        target_nodes = controller.get_all_nodes()
 
     logger.info(f"Managing {len(target_nodes)} nodes")
 
@@ -1684,7 +1984,7 @@ def run_operator(
                         # Create updated reservation object
                         duration = parse_duration_string(reservation_duration)
                         updated_reservation = Reservation(
-                            name=f"maint:{node_name}",
+                            name="maint-" + USER + f":{node_name}",
                             nodes=[node_name],
                             start_time=new_reservation_start_time,
                             duration=duration,
@@ -1701,10 +2001,12 @@ def run_operator(
 
             # Phase 1: Create new reservations for nodes that don't have them
             if enable_reservations:
+                completed_nodes = manager.get_nodes_by_state(RebootState.COMPLETED)
                 nodes_needing_reservations = [
                     node
                     for node in target_nodes
                     if node not in existing_reservation_nodes
+                    and node not in completed_nodes
                 ]
 
                 logger.info(
@@ -1774,7 +2076,7 @@ def run_operator(
                     # Create reservation object and create it in Slurm
                     duration = parse_duration_string(reservation_duration)
                     reservation = Reservation(
-                        name=f"maint:{node_name}",
+                        name="maint-" + USER + f":{node_name}",
                         nodes=[node_name],
                         start_time=reservation_start_time,
                         duration=duration,
@@ -1849,6 +2151,7 @@ def run_operator(
                 for node_name in rebooting_nodes:
                     if manager.monitor_node_recovery(node_name):
                         manager.complete_node_reboot(node_name)
+                        reservation_manager.delete_by_name(f"maint-{USER}:{node_name}")
 
                 # Display reboot summary
                 summary = manager.get_reboot_summary(partition)
@@ -1982,6 +2285,21 @@ def run_operator(
     show_default=True,
 )
 @click.option(
+    "--post-reboot-hook",
+    type=str,
+    default="/usr/local/lib/monit/bin/autoresume-slurm.sh --now",
+    help="Path to script to run after node reboot completes (executed via clush on each node)",
+    show_default=True,
+)
+@click.option(
+    "--pre-reboot-hook",
+    type=str,
+    default=None,
+    help="Path to script to run before node reboot (executed via clush on each node). "
+         "Hook failure blocks the reboot.",
+    show_default=True,
+)
+@click.option(
     "--enable-reservations",
     is_flag=True,
     help="Enable creation of maintenance reservations",
@@ -2037,6 +2355,7 @@ def run_operator(
     "--flags",
     "-f",
     help="Reservation flags (e.g., MAINT,IGNORE_JOBS)",
+    default="MAINT",
 )
 @click.option(
     "--verbose",
@@ -2054,6 +2373,8 @@ def main(
     reservation_duration: str,
     reservation_lead_time: int,
     reboot_timeout: int,
+    post_reboot_hook: Optional[str],
+    pre_reboot_hook: Optional[str],
     enable_reservations: bool,
     enable_reboots: bool,
     decommission: bool,
@@ -2165,6 +2486,8 @@ def main(
         decommission=decommission,
         revive=revive,
         enable_decommission=enable_decommission,
+        post_reboot_hook=post_reboot_hook,
+        pre_reboot_hook=pre_reboot_hook,
     )
 
 
