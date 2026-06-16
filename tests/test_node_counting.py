@@ -219,14 +219,14 @@ def test_combined_counting_no_overlap():
     assert combined_count == 13, f"Expected 13 combined (5+8), got {combined_count}"
     assert combined_percentage == 13.0, f"Expected 13%, got {combined_percentage}%"
 
-    # Check can_add_reservation
-    can_add = manager.can_add_reservation("compute")
-    assert not can_add, "Should not be able to add reservation (13% > 10%)"
+    # Check can_add_reservation (simulating adding a new node)
+    can_add = manager.can_add_reservation("compute", "sdfcompute099")
+    assert not can_add, "Should not be able to add reservation (13% + 1 node > 10%)"
 
     print("  ✓ Unavailable: 5/100 (5%)")
     print("  ✓ Down: 8/100 (8%)")
     print("  ✓ Combined: 13/100 (13%) - no overlap")
-    print("  ✓ Correctly blocked adding reservation (13% > 10% limit)")
+    print("  ✓ Correctly blocked adding reservation (14/100 would be 14% > 10% limit)")
     print()
 
 
@@ -290,9 +290,9 @@ def test_combined_counting_with_overlap():
     assert combined_count == 11, f"Expected 11 combined (5+8-2), got {combined_count}"
     assert combined_percentage == 11.0, f"Expected 11%, got {combined_percentage}%"
 
-    # Check can_add_reservation
-    can_add = manager.can_add_reservation("compute")
-    assert can_add, "Should be able to add reservation (11% < 15%)"
+    # Check can_add_reservation (simulating adding a new node)
+    can_add = manager.can_add_reservation("compute", "sdfcompute099")
+    assert can_add, "Should be able to add reservation (12/100 = 12% < 15%)"
 
     print("  ✓ Unavailable: 5/100 (5%)")
     print("  ✓ Down: 8/100 (8%)")

@@ -1265,9 +1265,18 @@ class MaintenanceManager:
         self.state_file = state_file
         self.node_reboot_status: Dict[str, NodeRebootStatus] = {}
         self.target_nodes = set(target_nodes) if target_nodes else None
+        self._pending_reservations_this_iteration: Set[str] = set()  # Track nodes approved this iteration
 
         if self.state_file:
             self.load_state()
+
+    def reset_pending_reservations(self) -> None:
+        """Reset the pending reservations tracker at the start of a new iteration."""
+        self._pending_reservations_this_iteration = set()
+
+    def mark_reservation_pending(self, node_name: str) -> None:
+        """Mark a node as having an approved (but not yet Slurm-visible) reservation."""
+        self._pending_reservations_this_iteration.add(node_name)
 
     def get_maintenance_reservations(self) -> List[Reservation]:
         """Get all maintenance reservations from Slurm."""
@@ -1388,12 +1397,18 @@ class MaintenanceManager:
         )
         return (down_count, total_nodes, down_nodes)
 
-    def can_add_reservation(self, partition: str) -> bool:
+    def can_add_reservation(self, partition: str, node_name: str) -> bool:
         """
-        Check if we can add another reservation without exceeding max percentage.
+        Check if we're currently under the max percentage limit (before adding this node).
 
-        This considers both unavailable nodes (maintenance-related) and down nodes
-        (Slurm's native DOWN state) to ensure we don't exceed the limit.
+        Accounts for:
+        - Nodes in active/starting-soon Slurm reservations
+        - Nodes in reboot states (PENDING/REBOOTING/AWAITING_REVIVAL)
+        - Nodes Slurm considers DOWN
+        - Nodes approved for reservation earlier in THIS iteration
+
+        Returns True if currently under limit, allowing this node to be added
+        (even if adding it would push us to or slightly over the limit).
         """
         unavailable_count, total_nodes, unavailable_nodes = (
             self.count_unavailable_nodes(partition)
@@ -1403,28 +1418,35 @@ class MaintenanceManager:
         if total_nodes == 0:
             return False
 
-        # Count unique nodes that are either unavailable or down
-        combined_nodes = unavailable_nodes.union(down_nodes)
-        combined_count = len(combined_nodes)
+        # Combine Slurm state with pending reservations from this iteration
+        combined_nodes = (
+            unavailable_nodes
+            .union(down_nodes)
+            .union(self._pending_reservations_this_iteration)
+        )
 
+        combined_count = len(combined_nodes)
         current_percentage = (combined_count / total_nodes) * 100
 
-        # Separate counts for logging
+        # Enhanced logging
         unavailable_percentage = (unavailable_count / total_nodes) * 100
         down_percentage = (down_count / total_nodes) * 100
         overlap_count = len(unavailable_nodes.intersection(down_nodes))
+        pending_count = len(self._pending_reservations_this_iteration)
 
         logger.debug(
-            f"Partition '{partition}': {combined_count}/{total_nodes} nodes unavailable or down "
-            f"({current_percentage:.1f}% of max {self.max_down_percentage}%) - "
-            f"unavailable: {unavailable_count} ({unavailable_percentage:.1f}%), "
-            f"down: {down_count} ({down_percentage:.1f}%), "
-            f"overlap: {overlap_count}"
+            f"Capacity check for {node_name}: {combined_count}/{total_nodes} currently unavailable "
+            f"({current_percentage:.1f}% of {self.max_down_percentage}%) - "
+            f"Slurm: {unavailable_count} unavailable ({unavailable_percentage:.1f}%), "
+            f"{down_count} down ({down_percentage:.1f}%), "
+            f"overlap: {overlap_count}, "
+            f"pending this iteration: {pending_count}"
         )
 
         if current_percentage >= self.max_down_percentage:
             logger.debug(
-                f"Cannot add reservation: would exceed max unavailable/down percentage"
+                f"Cannot add reservation for {node_name}: at or exceeds limit "
+                f"({current_percentage:.1f}% >= {self.max_down_percentage}%)"
             )
             return False
 
@@ -1828,6 +1850,9 @@ def run_operator(
 
             logger.info(f"--- Iteration {iteration} ---")
 
+            # Reset pending reservations tracker for new iteration
+            manager.reset_pending_reservations()
+
             # Seed decommission/revival state from nodelist flags (idempotent)
             if enable_decommission:
                 if revive:
@@ -2017,12 +2042,16 @@ def run_operator(
                     # Use the partition argument (now required)
                     node_partition = partition
 
-                    # Check if we can add a reservation
-                    if not manager.can_add_reservation(node_partition):
+                    # Check if we can add a reservation for THIS node
+                    if not manager.can_add_reservation(node_partition, node_name):
                         logger.debug(
-                            f"Deferring reservation for '{node_name}' due to max down percentage"
+                            f"Deferring reservation for '{node_name}' due to max down percentage "
+                            f"({len(manager._pending_reservations_this_iteration)} pending this iteration)"
                         )
                         continue
+
+                    # Mark as pending IMMEDIATELY after check passes
+                    manager.mark_reservation_pending(node_name)
 
                     # Get jobs on node
                     job_list = controller.get_jobs_on_node(node_name)
