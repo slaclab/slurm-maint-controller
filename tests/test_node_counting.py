@@ -51,8 +51,6 @@ def create_mock_reservation(name, nodes, is_active=True, is_starting_soon=False)
 
 def test_count_unavailable_nodes():
     """Test counting unavailable nodes (maintenance-related)."""
-    print("Testing count_unavailable_nodes()...")
-
     # Create mock objects
     controller = Mock(spec=SlurmController)
     reservation_manager = Mock(spec=ReservationManager)
@@ -104,14 +102,10 @@ def test_count_unavailable_nodes():
     assert unavailable_nodes == {"sdfcompute01", "sdfcompute02", "sdfcompute03", "sdfcompute04"}, \
         f"Unexpected unavailable nodes: {unavailable_nodes}"
 
-    print("  ✓ Correctly counted 4 unavailable nodes (2 reservations + 2 reboot states)")
-    print()
 
 
 def test_count_down_nodes_slurm():
     """Test counting down nodes according to Slurm."""
-    print("Testing count_down_nodes_slurm()...")
-
     # Create mock objects
     controller = Mock(spec=SlurmController)
     reservation_manager = Mock(spec=ReservationManager)
@@ -157,14 +151,10 @@ def test_count_down_nodes_slurm():
     assert down_nodes == {"sdfcompute03", "sdfcompute04", "sdfcompute05"}, \
         f"Unexpected down nodes: {down_nodes}"
 
-    print("  ✓ Correctly counted 3 down nodes (DOWN, DRAIN, IDLE+DRAIN)")
-    print()
 
 
 def test_combined_counting_no_overlap():
     """Test combined counting when there's no overlap between unavailable and down."""
-    print("Testing combined counting (no overlap)...")
-
     # Create mock objects
     controller = Mock(spec=SlurmController)
     reservation_manager = Mock(spec=ReservationManager)
@@ -223,17 +213,9 @@ def test_combined_counting_no_overlap():
     can_add = manager.can_add_reservation("compute", "sdfcompute099")
     assert not can_add, "Should not be able to add reservation (13% + 1 node > 10%)"
 
-    print("  ✓ Unavailable: 5/100 (5%)")
-    print("  ✓ Down: 8/100 (8%)")
-    print("  ✓ Combined: 13/100 (13%) - no overlap")
-    print("  ✓ Correctly blocked adding reservation (14/100 would be 14% > 10% limit)")
-    print()
-
 
 def test_combined_counting_with_overlap():
     """Test combined counting when some nodes are both unavailable and down."""
-    print("Testing combined counting (with overlap)...")
-
     # Create mock objects
     controller = Mock(spec=SlurmController)
     reservation_manager = Mock(spec=ReservationManager)
@@ -294,18 +276,9 @@ def test_combined_counting_with_overlap():
     can_add = manager.can_add_reservation("compute", "sdfcompute099")
     assert can_add, "Should be able to add reservation (12/100 = 12% < 15%)"
 
-    print("  ✓ Unavailable: 5/100 (5%)")
-    print("  ✓ Down: 8/100 (8%)")
-    print("  ✓ Overlap: 2 nodes (sdfcompute003, sdfcompute004)")
-    print("  ✓ Combined: 11/100 (11%) = 5 + 8 - 2")
-    print("  ✓ Correctly allowed adding reservation (11% < 15% limit)")
-    print()
-
 
 def test_all_down_states():
-    """Test that all expected down states are recognized."""
-    print("Testing all down states recognition...")
-    
+    """Test that all expected down states are recognized."""    
     down_states_to_test = [
         "DOWN", "DOWN*", "DRAIN", "DRAINED", "DRAINING", "DRAINING*",
         "FAIL", "FAILING", "NOT_RESPONDING", "NO_RESPOND",
@@ -315,15 +288,10 @@ def test_all_down_states():
     for state in down_states_to_test:
         node = NodeState(name="test-node", state=state)
         assert node.is_down(), f"State '{state}' should be recognized as down"
-    
-    print(f"  ✓ All {len(down_states_to_test)} down states correctly recognized")
-    print()
 
 
 def test_count_unavailable_nodes_partition_filtering():
     """Test that count_unavailable_nodes filters reservations by partition."""
-    print("Testing count_unavailable_nodes() partition filtering...")
-
     # Create mock objects
     controller = Mock(spec=SlurmController)
     reservation_manager = Mock(spec=ReservationManager)
@@ -363,15 +331,10 @@ def test_count_unavailable_nodes_partition_filtering():
     assert unavailable_nodes == {"sdfcompute001", "sdfcompute002"}, \
         f"Expected only compute nodes, got {unavailable_nodes}"
 
-    print("  ✓ Correctly filtered out gpu partition reservations")
-    print("  ✓ Only counted compute partition reservations (2/10)")
-    print()
 
 
 def test_count_unavailable_nodes_cross_partition_isolation():
     """Test that operators for different partitions don't interfere with each other."""
-    print("Testing cross-partition isolation...")
-
     # Create mock objects
     controller = Mock(spec=SlurmController)
     reservation_manager = Mock(spec=ReservationManager)
@@ -433,16 +396,9 @@ def test_count_unavailable_nodes_cross_partition_isolation():
     assert compute_unavailable_nodes == set(), \
         f"Compute: Expected empty set, got {compute_unavailable_nodes}"
 
-    print("  ✓ GPU partition correctly sees 2/3 nodes unavailable (sdfgpu001, sdfgpu002)")
-    print("  ✓ Compute partition correctly sees 0/4 nodes unavailable")
-    print("  ✓ Cross-partition interference prevented!")
-    print()
-
 
 def test_count_unavailable_nodes_backward_compatibility():
     """Test backward compatibility with non-sdf node names."""
-    print("Testing backward compatibility with non-sdf node names...")
-
     # Create mock objects
     controller = Mock(spec=SlurmController)
     reservation_manager = Mock(spec=ReservationManager)
@@ -481,48 +437,68 @@ def test_count_unavailable_nodes_backward_compatibility():
     assert unavailable_nodes == set(), \
         f"Expected empty set, got {unavailable_nodes}"
 
-    print("  ✓ Non-sdf node names correctly filtered out (returned None for partition)")
-    print("  ✓ Backward compatibility: non-sdf nodes not counted")
-    print()
+def test_pending_reservations_capacity_tracking():
+    """Test that pending reservations (approved but not yet in Slurm) are counted in capacity checks."""
+    # Create mock objects
+    controller = Mock(spec=SlurmController)
+    reservation_manager = Mock(spec=ReservationManager)
 
+    # Setup partition with 100 nodes
+    partition_info = PartitionInfo(
+        name="compute",
+        nodes=[f"sdfcompute{i:03d}" for i in range(1, 101)],
+        total_node_count=100
+    )
+    controller.get_partition_info.return_value = [partition_info]
 
-def run_all_tests():
-    """Run all integration tests."""
-    print("=" * 70)
-    print("Running Node Counting Integration Tests")
-    print("=" * 70)
-    print()
+    # Setup: No existing reservations in Slurm (simulating first iteration)
+    reservation_manager.get_maintenance.return_value = []
+
+    # Setup: No down nodes
+    node_states = {}
+    controller.get_node_states.return_value = node_states
+
+    # Create manager with 10% limit (allows 10 nodes)
+    manager = MaintenanceManager(
+        controller=controller,
+        reservation_manager=reservation_manager,
+        max_down_percentage=10.0,
+        reboot_timeout=600,
+        reservation_lead_time=60,
+        state_file=None,
+        target_nodes=None
+    )
+
+    # Reset pending reservations (simulating iteration start)
+    manager.reset_pending_reservations()
+
+    # Simulate sequential approval of reservations
+    approved_nodes = []
+    for i in range(1, 15):  # Try to approve 14 nodes (should only approve 10)
+        node_name = f"sdfcompute{i:03d}"
+        can_add = manager.can_add_reservation("compute", node_name)
+
+        if can_add:
+            # Mark as pending immediately after approval
+            manager.mark_reservation_pending(node_name)
+            approved_nodes.append(node_name)
+        else:
+            # Should be rejected once we hit the limit
+            break
+
+    # Verify: Should have approved exactly 10 nodes (10% of 100)
+    assert len(approved_nodes) == 10, \
+        f"Expected to approve 10 nodes (10% limit), but approved {len(approved_nodes)}"
+
+    # Verify: 11th node should be rejected
+    node_11 = "sdfcompute011"
+    can_add_11 = manager.can_add_reservation("compute", node_11)
+    assert not can_add_11, \
+        f"Should reject 11th node (would be 11%), but was approved"
+
+    # Verify: After reset, same node should be approved again
+    manager.reset_pending_reservations()
+    can_add_after_reset = manager.can_add_reservation("compute", "sdfcompute001")
+    assert can_add_after_reset, \
+        "Should be able to approve node after reset (pending cleared)"
     
-    try:
-        test_count_unavailable_nodes()
-        test_count_down_nodes_slurm()
-        test_combined_counting_no_overlap()
-        test_combined_counting_with_overlap()
-        test_all_down_states()
-        test_count_unavailable_nodes_partition_filtering()
-        test_count_unavailable_nodes_cross_partition_isolation()
-        test_count_unavailable_nodes_backward_compatibility()
-        
-        print("=" * 70)
-        print("🎉 All integration tests passed!")
-        print("=" * 70)
-        return 0
-        
-    except AssertionError as e:
-        print()
-        print("=" * 70)
-        print(f"❌ Test failed: {e}")
-        print("=" * 70)
-        return 1
-    except Exception as e:
-        print()
-        print("=" * 70)
-        print(f"❌ Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
-        print("=" * 70)
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(run_all_tests())
