@@ -34,30 +34,13 @@ def test_node_state_detection():
         ("down", True, "lowercase down should be considered down"),
         ("Reserved", False, "Reserved nodes should not be considered down"),
     ]
-    
-    print("Testing node state detection:\n")
-    
+        
     all_passed = True
     for state, expected_down, description in test_cases:
         node = NodeState(name="test-node", state=state)
         is_down = node.is_down()
         
-        status = "✓ PASS" if is_down == expected_down else "✗ FAIL"
         if is_down != expected_down:
             all_passed = False
         
-        print(f"{status}: {description}")
-        print(f"       State: '{state}' -> is_down()={is_down} (expected={expected_down})")
-        print()
-    
-    if all_passed:
-        print("\n🎉 All tests passed!")
-        return 0
-    else:
-        print("\n❌ Some tests failed!")
-        return 1
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(test_node_state_detection())
+    assert all_passed, "Some test cases failed. Please review the output above for details."
