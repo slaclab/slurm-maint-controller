@@ -45,8 +45,6 @@ def test_full_decommission_lifecycle():
     revival and recovery — exercising every state transition and confirming
     the node is unavailable throughout until it is fully restored.
     """
-    print("Testing full decommission lifecycle + capacity counting...")
-
     manager = make_manager(total=10, max_pct=10.0)
 
     # Seed: node is staged for decommission and shows up as unavailable
@@ -86,19 +84,12 @@ def test_full_decommission_lifecycle():
     manager.complete_node_reboot("node01")
     assert manager.node_reboot_status["node01"].state == RebootState.COMPLETED
 
-    print("  ✓ PENDING → AWAITING_REVIVAL → PENDING → REBOOTING → COMPLETED")
-    print("  ✓ Node counted as unavailable in PENDING and AWAITING_REVIVAL states")
-    print("  ✓ Revival on wrong state is a no-op")
-    print()
-
 
 def test_serialisation_roundtrip_and_backward_compat():
     """
     State file round-trip preserves maintenance_type, and old state files
     (without the field) deserialise cleanly as 'reboot'.
     """
-    print("Testing serialisation round-trip and backward compatibility...")
-
     original = NodeRebootStatus(
         node_name="node01",
         partition="compute",
@@ -118,33 +109,3 @@ def test_serialisation_roundtrip_and_backward_compat():
     old_data = {k: v for k, v in data.items() if k != "maintenance_type"}
     old_status = NodeRebootStatus.from_dict(old_data)
     assert old_status.maintenance_type == MaintananceType.REBOOT
-
-    print("  ✓ Round-trip preserves maintenance_type and AWAITING_REVIVAL state")
-    print("  ✓ Old state files without maintenance_type default to 'reboot'")
-    print()
-
-
-def run_all_tests():
-    print("=" * 70)
-    print("Running Decommission & Revival Tests")
-    print("=" * 70)
-    print()
-    try:
-        test_full_decommission_lifecycle()
-        test_serialisation_roundtrip_and_backward_compat()
-        print("=" * 70)
-        print("All decommission tests passed!")
-        print("=" * 70)
-        return 0
-    except AssertionError as e:
-        print(f"\nTest failed: {e}")
-        return 1
-    except Exception as e:
-        import traceback
-        print(f"\nUnexpected error: {e}")
-        traceback.print_exc()
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(run_all_tests())
