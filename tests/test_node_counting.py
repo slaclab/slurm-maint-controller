@@ -211,7 +211,7 @@ def test_combined_counting_no_overlap():
 
     # Check can_add_reservation (simulating adding a new node)
     can_add = manager.can_add_reservation("compute", "sdfcompute099")
-    assert not can_add, "Should not be able to add reservation (13% + 1 node > 10%)"
+    assert not can_add, "Should not be able to add reservation (13% >= 10% limit)"
 
 
 def test_combined_counting_with_overlap():
@@ -274,11 +274,11 @@ def test_combined_counting_with_overlap():
 
     # Check can_add_reservation (simulating adding a new node)
     can_add = manager.can_add_reservation("compute", "sdfcompute099")
-    assert can_add, "Should be able to add reservation (12/100 = 12% < 15%)"
+    assert can_add, "Should be able to add reservation (11% < 15% limit)"
 
 
 def test_all_down_states():
-    """Test that all expected down states are recognized."""    
+    """Test that all expected down states are recognized."""
     down_states_to_test = [
         "DOWN", "DOWN*", "DRAIN", "DRAINED", "DRAINING", "DRAINING*",
         "FAIL", "FAILING", "NOT_RESPONDING", "NO_RESPOND",
