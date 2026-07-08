@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Any
 
 import click
 import pendulum
@@ -1264,6 +1264,7 @@ class MaintenanceManager:
         self.post_reboot_delay = 300  # seconds
         self.state_file = state_file
         self.node_reboot_status: Dict[str, NodeRebootStatus] = {}
+        self.reservation_tracking: Dict[str, Dict[str, Any]] = {}
         self.target_nodes = set(target_nodes) if target_nodes else None
         self._pending_reservations_this_iteration: Set[str] = set()  # Track nodes approved this iteration
 
@@ -1281,6 +1282,26 @@ class MaintenanceManager:
     def get_maintenance_reservations(self) -> List[Reservation]:
         """Get all maintenance reservations from Slurm."""
         return self.reservation_manager.get_maintenance()
+
+    def mark_reservation_created(self, node_name: str, reservation_name: str) -> None:
+        """Record that we created a reservation for this node."""
+        self.reservation_tracking[node_name] = {
+            "created_at": datetime.now().isoformat(),
+            "reservation_name": reservation_name,
+        }
+        logger.debug(f"Marked reservation created for '{node_name}': {reservation_name}")
+
+    def is_reservation_handled(self, node_name: str) -> bool:
+        """
+        Check if we already created a reservation for this node (regardless of current Slurm state).
+
+        Returns True if we created a reservation for this node before (tracked).
+        This prevents recreating reservations that users manually deleted.
+        """
+        if node_name in self.reservation_tracking:
+            logger.debug(f"Node '{node_name}' reservation already tracked (handled)")
+            return True
+        return False
 
     def count_unavailable_nodes(self, partition: str) -> Tuple[int, int, Set[str]]:
         """
@@ -1678,7 +1699,8 @@ class MaintenanceManager:
                 "node_reboot_status": {
                     node_name: status.to_dict()
                     for node_name, status in self.node_reboot_status.items()
-                }
+                },
+                "reservation_tracking": self.reservation_tracking,
             }
 
             with open(self.state_file, "w") as f:
@@ -1704,8 +1726,13 @@ class MaintenanceManager:
                 ).items()
             }
 
+            # Load reservation tracking
+            self.reservation_tracking = state_data.get("reservation_tracking", {})
+
             logger.info(
-                f"Loaded state from {self.state_file} ({len(self.node_reboot_status)} nodes)"
+                f"Loaded state from {self.state_file} "
+                f"({len(self.node_reboot_status)} reboot statuses, "
+                f"{len(self.reservation_tracking)} tracked reservations)"
             )
         except Exception as e:
             logger.error(f"Failed to load state: {e}")
@@ -2042,7 +2069,25 @@ def run_operator(
                     # Use the partition argument (now required)
                     node_partition = partition
 
-                    # Check if we can add a reservation for THIS node
+                    # Check if we already created a reservation for this node
+                    if manager.is_reservation_handled(node_name):
+                        logger.debug(f"Skipping '{node_name}': reservation already handled")
+                        continue
+
+                    # Get jobs on node and check non-preemptable jobs
+                    job_list = controller.get_jobs_on_node(node_name)
+                    preemptable_jobs = JobList(job_list.filter(qos="preemptable"))
+                    non_preemptable_jobs = JobList(job_list.filter(qos="!preemptable"))
+
+                    # Skip if non-preemptable jobs present
+                    if len(non_preemptable_jobs) > 0:
+                        logger.debug(
+                            f"Skipping reservation for '{node_name}': "
+                            f"{len(non_preemptable_jobs)} non-preemptable jobs running"
+                        )
+                        continue
+
+                    # Check if we can add a reservation
                     if not manager.can_add_reservation(node_partition, node_name):
                         logger.debug(
                             f"Deferring reservation for '{node_name}' due to max down percentage "
@@ -2052,11 +2097,6 @@ def run_operator(
 
                     # Mark as pending IMMEDIATELY after check passes
                     manager.mark_reservation_pending(node_name)
-
-                    # Get jobs on node
-                    job_list = controller.get_jobs_on_node(node_name)
-                    preemptable_jobs = JobList(job_list.filter(qos="preemptable"))
-                    non_preemptable_jobs = JobList(job_list.filter(qos="!preemptable"))
 
                     longest_preemptable = preemptable_jobs.get_longest_job()
                     longest_non_preemptable = non_preemptable_jobs.get_longest_job()
@@ -2118,6 +2158,9 @@ def run_operator(
                         f"Creating reservation for {node_name} starting at {reservation_start_time.to_datetime_string()}"
                     )
                     reservation_manager.create_or_update(reservation)
+
+                    # Track that we created this reservation
+                    manager.mark_reservation_created(node_name, reservation.name)
 
             # Phase 2: Manage reboots for nodes in active reservations
             if enable_reboots:
