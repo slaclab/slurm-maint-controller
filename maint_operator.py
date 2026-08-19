@@ -1920,6 +1920,10 @@ def run_operator(
                     if not node_name:
                         continue
 
+                    # Only touch reservations for nodes in scope for this invocation
+                    if node_name not in target_nodes:
+                        continue
+
                     # Skip if reservation is already active (too late to update)
                     if res.is_active():
                         logger.debug(
@@ -2163,6 +2167,10 @@ def run_operator(
                 for res in active_reservations:
                     node_name = res.get_node_name()
                     if not node_name:
+                        continue
+
+                    # Only touch reservations for nodes in scope for this invocation
+                    if node_name not in target_nodes:
                         continue
 
                     # Use the partition argument (now required)
