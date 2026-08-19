@@ -1255,6 +1255,7 @@ class MaintenanceManager:
         reservation_lead_time: int = 60,
         state_file: Optional[str] = None,
         target_nodes: Optional[List[str]] = None,
+        dry_run: bool = False,
     ):
         self.controller = controller
         self.reservation_manager = reservation_manager
@@ -1267,6 +1268,7 @@ class MaintenanceManager:
         self.reservation_tracking: Dict[str, Dict[str, Any]] = {}
         self.target_nodes = set(target_nodes) if target_nodes else None
         self._pending_reservations_this_iteration: Set[str] = set()  # Track nodes approved this iteration
+        self.dry_run = dry_run
 
         if self.state_file:
             self.load_state()
@@ -1285,6 +1287,10 @@ class MaintenanceManager:
 
     def mark_reservation_created(self, node_name: str, reservation_name: str) -> None:
         """Record that we created a reservation for this node."""
+        if self.dry_run:
+            logger.debug(f"Dry run mode: would mark reservation created for '{node_name}': {reservation_name}")
+            return
+
         self.reservation_tracking[node_name] = {
             "created_at": datetime.now().isoformat(),
             "reservation_name": reservation_name,
@@ -1694,6 +1700,10 @@ class MaintenanceManager:
             logger.debug("No state file configured, skipping save")
             return
 
+        if self.dry_run:
+            logger.debug("Dry run mode: skipping state save")
+            return
+
         try:
             state_data = {
                 "node_reboot_status": {
@@ -1847,6 +1857,7 @@ def run_operator(
         reservation_lead_time=reservation_lead_time,
         state_file=state_file,
         target_nodes=target_nodes,
+        dry_run=dry_run,
     )
 
     logger.info(f"Starting Slurm Maintenance Operator (interval: {interval}s)")
@@ -1931,6 +1942,20 @@ def run_operator(
                         f"{len(non_preemptable_jobs)} non-preemptable"
                     )
 
+                    # If non-preemptable jobs are present, delete the reservation
+                    if len(non_preemptable_jobs) > 0:
+                        logger.info(
+                            f"Deleting reservation for {node_name}: "
+                            f"{len(non_preemptable_jobs)} non-preemptable job(s) now running, "
+                            f"will defer until next iteration when jobs complete"
+                        )
+                        reservation_manager.delete(res)
+                        # Remove from tracking so it can be recreated later
+                        if node_name in manager.reservation_tracking:
+                            del manager.reservation_tracking[node_name]
+                            logger.debug(f"Removed {node_name} from reservation tracking")
+                        continue
+
                     longest_preemptable = preemptable_jobs.get_longest_job()
                     longest_non_preemptable = non_preemptable_jobs.get_longest_job()
 
@@ -1946,48 +1971,24 @@ def run_operator(
                         )
 
                     # Determine what the reservation start time should be
+                    # At this point, we know there are no non-preemptable jobs (they were handled above)
                     new_reservation_start_time = pendulum.now()
 
-                    if len(non_preemptable_jobs) == 0:
-                        # Only preemptable jobs
-                        if terminate_preemptable_jobs:
-                            # Jobs will be terminated, start soon
-                            logger.debug(
-                                f"  {node_name}: Only preemptable jobs, will terminate -> start soon"
-                            )
-                            new_reservation_start_time = (
-                                pendulum.now() + pendulum.duration(seconds=1)
-                            )
-                        else:
-                            if longest_preemptable:
-                                logger.debug(
-                                    f"  {node_name}: Only preemptable jobs, not terminating -> wait for longest"
-                                )
-                                new_reservation_start_time = (
-                                    longest_preemptable.end_time
-                                )
-                            else:
-                                logger.debug(f"  {node_name}: No jobs -> start soon")
-                                new_reservation_start_time = (
-                                    pendulum.now() + pendulum.duration(seconds=1)
-                                )
-
-                    elif longest_non_preemptable and preemptable_jobs:
-                        # Both types of jobs - use longest non-preemptable
+                    # Only preemptable jobs or no jobs
+                    if terminate_preemptable_jobs:
+                        # Jobs will be terminated, start soon
                         logger.debug(
-                            f"  {node_name}: Both job types -> wait for longest non-preemptable"
+                            f"  {node_name}: Only preemptable jobs, will terminate -> start soon"
                         )
-                        new_reservation_start_time = longest_non_preemptable.end_time
-
+                        new_reservation_start_time = (
+                            pendulum.now() + pendulum.duration(seconds=1)
+                        )
                     else:
-                        # Only non-preemptable jobs
-                        if longest_non_preemptable:
+                        if longest_preemptable:
                             logger.debug(
-                                f"  {node_name}: Only non-preemptable jobs -> wait for longest"
+                                f"  {node_name}: Only preemptable jobs, not terminating -> wait for longest"
                             )
-                            new_reservation_start_time = (
-                                longest_non_preemptable.end_time
-                            )
+                            new_reservation_start_time = longest_preemptable.end_time
                         else:
                             logger.debug(f"  {node_name}: No jobs -> start soon")
                             new_reservation_start_time = (
@@ -2014,24 +2015,10 @@ def run_operator(
                         )
 
                         # Terminate preemptable jobs if needed
-                        if (
-                            terminate_preemptable_jobs
-                            and len(non_preemptable_jobs) == 0
-                        ):
+                        if terminate_preemptable_jobs:
                             logger.info(f"Terminating preemptable jobs on {node_name}")
                             for job in preemptable_jobs:
                                 controller.terminate_job(job)
-                        elif (
-                            terminate_preemptable_jobs
-                            and longest_non_preemptable
-                            and preemptable_jobs
-                        ):
-                            for job in preemptable_jobs:
-                                if job.end_time > longest_non_preemptable.end_time:
-                                    logger.info(
-                                        f"Terminating preemptable job {job.job_id} on {node_name}"
-                                    )
-                                    controller.terminate_job(job)
 
                         # Create updated reservation object
                         duration = parse_duration_string(reservation_duration)
